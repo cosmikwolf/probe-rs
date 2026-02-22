@@ -7,6 +7,7 @@ use crate::{
     vendor::{
         Vendor,
         nxp::sequences::{
+            kinetis::Kinetis,
             mcx::MCX,
             nxp_armv6m::LPC80x,
             nxp_armv7m::{MIMXRT10xx, MIMXRT11xx},
@@ -45,6 +46,8 @@ impl Vendor for Nxp {
             DebugSequence::Arm(OL23D0::create())
         } else if chip.name.starts_with("MCX") {
             DebugSequence::Arm(MCX::create(chip.name.clone()))
+        } else if chip.name.starts_with("MK") {
+            DebugSequence::Arm(Kinetis::create())
         } else {
             return None;
         };

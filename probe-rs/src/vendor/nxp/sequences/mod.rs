@@ -1,5 +1,6 @@
 //! NXP debug sequences.
 
+pub mod kinetis;
 pub mod mcx;
 pub mod nxp_armv6m;
 pub mod nxp_armv7m;
