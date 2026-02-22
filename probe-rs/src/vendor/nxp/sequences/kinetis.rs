@@ -25,13 +25,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::MemoryMappedRegister;
 use crate::architecture::arm::{
     ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
     memory::ArmMemoryInterface,
     sequences::{ArmDebugSequence, ArmDebugSequenceError, DebugEraseSequence},
 };
 use crate::session::MissingPermissions;
-use crate::MemoryMappedRegister;
 
 const MDM_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(1);
 
@@ -61,6 +61,52 @@ impl Kinetis {
     pub fn create() -> Arc<dyn ArmDebugSequence> {
         Arc::new(Self)
     }
+
+    /// Set C_DEBUGEN + VC_CORERESET via MEM-AP, then release CORE_HOLD_RES.
+    ///
+    /// Requires CORE_HOLD_RES active (from `mdm_halt`). The core exits the held
+    /// state and immediately halts via VC_CORERESET, giving proper S_HALT=1.
+    fn enter_debug_halt(
+        &self,
+        iface: &mut dyn ArmDebugInterface,
+        core_ap: &FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
+
+        tracing::debug!("Kinetis: configuring debug halt via MEM-AP");
+
+        {
+            let mut core = iface.memory_interface(core_ap)?;
+
+            let mut dhcsr = Dhcsr(0);
+            dhcsr.set_c_debugen(true);
+            dhcsr.enable_write();
+            core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+
+            let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
+            demcr.set_vc_corereset(true);
+            core.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
+        }
+
+        iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, 0)?;
+
+        let start = Instant::now();
+        loop {
+            let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
+            if (status & MDM_STAT_CORE_HALTED) != 0 {
+                tracing::debug!("Kinetis: core in debug halt mode (status: {status:#010x})");
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_millis(500) {
+                tracing::warn!(
+                    "Kinetis: CORE_HALTED not set after releasing CORE_HOLD_RES \
+                     (status: {status:#010x})"
+                );
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// Check if the device is secured by sampling SYSSEC with FREADY+SYSRES gating.
@@ -79,9 +125,7 @@ fn is_secured(iface: &mut dyn DapAccess) -> Result<bool, ArmError> {
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
-            tracing::warn!(
-                "Kinetis: FREADY+SYSRES not both set after 3s (status: {status:#010x})"
-            );
+            tracing::warn!("Kinetis: FREADY+SYSRES not both set after 3s (status: {status:#010x})");
             break;
         }
         thread::sleep(Duration::from_millis(10));
@@ -173,7 +217,7 @@ fn mdm_halt(iface: &mut dyn DapAccess) -> Result<(), ArmError> {
         }
         if start.elapsed() > Duration::from_millis(500) {
             // Expected: CORE_HALTED requires C_DEBUGEN which isn't set yet.
-            // CORE_HOLD_RES still prevents execution. mdm_enter_debug_halt
+            // CORE_HOLD_RES still prevents execution. enter_debug_halt
             // will set C_DEBUGEN and VC_CORERESET to achieve proper halt.
             tracing::debug!(
                 "Kinetis MDM halt: CORE_HALTED not set (status: {status:#010x}), \
@@ -229,11 +273,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_FMEIP)?;
     } else {
         tracing::info!("Kinetis mass erase: starting erase (SYS_RES_REQ + FMEIP)");
-        iface.write_raw_ap_register(
-            mdm_ap,
-            MDM_CONTROL,
-            MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP,
-        )?;
+        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP)?;
     }
 
     let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
@@ -265,7 +305,11 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         }
         if last_log.elapsed() > Duration::from_secs(2) {
             let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
-            let fmeack = if (status & MDM_STAT_FMEACK) != 0 { "yes" } else { "no" };
+            let fmeack = if (status & MDM_STAT_FMEACK) != 0 {
+                "yes"
+            } else {
+                "no"
+            };
             tracing::info!(
                 "Kinetis mass erase: waiting — ctrl={control:#010x}, \
                  status={status:#010x}, FMEACK={fmeack}, elapsed={}ms",
@@ -311,54 +355,6 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
     }
 
     Ok(())
-}
-
-/// Set C_DEBUGEN + VC_CORERESET via MEM-AP, then release CORE_HOLD_RES.
-///
-/// Requires CORE_HOLD_RES active (from `mdm_halt`). The core exits the held
-/// state and immediately halts via VC_CORERESET, giving proper S_HALT=1.
-fn mdm_enter_debug_halt(
-    _seq: &Kinetis,
-    iface: &mut dyn ArmDebugInterface,
-    core_ap: &FullyQualifiedApAddress,
-) -> Result<(), ArmError> {
-    use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
-
-    tracing::debug!("Kinetis: configuring debug halt via MEM-AP");
-
-    {
-        let mut core = iface.memory_interface(core_ap)?;
-
-        let mut dhcsr = Dhcsr(0);
-        dhcsr.set_c_debugen(true);
-        dhcsr.enable_write();
-        core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
-
-        let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
-        demcr.set_vc_corereset(true);
-        core.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
-    }
-
-    iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, 0)?;
-
-    let start = Instant::now();
-    loop {
-        let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
-        if (status & MDM_STAT_CORE_HALTED) != 0 {
-            tracing::debug!(
-                "Kinetis: core in debug halt mode (status: {status:#010x})"
-            );
-            return Ok(());
-        }
-        if start.elapsed() > Duration::from_millis(500) {
-            tracing::warn!(
-                "Kinetis: CORE_HALTED not set after releasing CORE_HOLD_RES \
-                 (status: {status:#010x})"
-            );
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
 }
 
 /// Disable the WDOG by uploading a 32-byte Thumb routine to SRAM and executing it.
@@ -407,7 +403,7 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     }
 
     core.write_word_32(DCRDR, WDOG_BASE)?;
-    core.write_word_32(DCRSR, (1 << 16) | 0)?; // R0
+    core.write_word_32(DCRSR, 1 << 16)?; // Write R0
     core.write_word_32(DCRDR, ALGO_ADDR)?;
     core.write_word_32(DCRSR, (1 << 16) | 15)?; // PC
 
@@ -440,9 +436,7 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     if (stctrlh & 1) == 0 {
         tracing::debug!("Kinetis WDOG disabled successfully (STCTRLH = {stctrlh:#06x})");
     } else {
-        tracing::warn!(
-            "Kinetis WDOG disable may have failed (STCTRLH = {stctrlh:#06x})"
-        );
+        tracing::warn!("Kinetis WDOG disable may have failed (STCTRLH = {stctrlh:#06x})");
     }
 
     Ok(())
@@ -472,12 +466,10 @@ impl ArmDebugSequence for Kinetis {
         if !is_secured(iface)? {
             tracing::info!("Kinetis device is unsecured");
 
-            if let Err(e) = mdm_enter_debug_halt(self, iface, _default_ap) {
-                tracing::warn!(
-                    "Kinetis: first debug halt attempt failed ({e}), retrying mdm_halt"
-                );
+            if let Err(e) = self.enter_debug_halt(iface, _default_ap) {
+                tracing::warn!("Kinetis: first debug halt attempt failed ({e}), retrying mdm_halt");
                 mdm_halt(iface)?;
-                mdm_enter_debug_halt(self, iface, _default_ap)?;
+                self.enter_debug_halt(iface, _default_ap)?;
             }
 
             return Ok(());
@@ -542,7 +534,9 @@ impl ArmDebugSequence for Kinetis {
     ) -> Result<(), ArmError> {
         let core_ap = interface.fully_qualified_address();
 
-        let iface = interface.get_arm_debug_interface().map_err(ArmError::from)?;
+        let iface = interface
+            .get_arm_debug_interface()
+            .map_err(ArmError::from)?;
 
         tracing::debug!("Kinetis: asserting system reset via MDM-AP");
         iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ)?;
