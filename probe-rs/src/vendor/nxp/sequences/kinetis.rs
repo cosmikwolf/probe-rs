@@ -189,11 +189,12 @@ fn mdm_halt(iface: &mut dyn DapAccess) -> Result<(), ArmError> {
             break;
         }
         if start.elapsed() > Duration::from_millis(500) {
-            // Core may not report CORE_HALTED if C_DEBUGEN isn't set yet,
-            // but CORE_HOLD_RES still prevents execution. Continue anyway.
-            tracing::warn!(
+            // Expected: CORE_HALTED requires C_DEBUGEN which isn't set yet.
+            // CORE_HOLD_RES still prevents execution. mdm_enter_debug_halt
+            // will set C_DEBUGEN and VC_CORERESET to achieve proper halt.
+            tracing::debug!(
                 "Kinetis MDM halt: CORE_HALTED not set (status: {status:#010x}), \
-                 but CORE_HOLD_RES should still prevent execution"
+                 CORE_HOLD_RES prevents execution"
             );
             break;
         }
@@ -433,6 +434,116 @@ fn mdm_enter_debug_halt(
     }
 }
 
+/// Disable the Kinetis WDOG by uploading and executing a small ARM algorithm.
+///
+/// The WDOG unlock sequence requires two writes to WDOG_UNLOCK within 20 bus
+/// cycles — too fast for SWD memory-mapped writes. Instead, we upload a 32-byte
+/// Thumb-2 routine to target RAM that performs the unlock and disable at CPU speed.
+///
+/// Must be called while the core is halted (e.g., caught by VC_CORERESET).
+///
+/// Based on OpenOCD's `armv7m_kinetis_wdog.s` algorithm.
+fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
+    use crate::architecture::arm::core::armv7m::Dhcsr;
+
+    // 32-byte position-independent Thumb-2 WDOG disable algorithm.
+    // Input: R0 = WDOG base address (0x40052000).
+    // Performs: unlock (0xC520, 0xD928) → clear STCTRLH.WDOGEN → bkpt.
+    // Source: openocd/contrib/loaders/watchdog/armv7m_kinetis_wdog.s
+    #[rustfmt::skip]
+    const WDOG_ALGO: [u32; 8] = [
+        0x81c2_4a04, // ldr  r2, [pc,#16]; strh r2, [r0,#0xe]  ; UNLOCK = 0xC520
+        0x81c2_4a04, // ldr  r2, [pc,#16]; strh r2, [r0,#0xe]  ; UNLOCK = 0xD928
+        0x8802_2401, // movs r4, #1;       ldrh r2, [r0,#0]     ; read STCTRLH
+        0x8002_43a2, // bics r2, r4;       strh r2, [r0,#0]     ; clear WDOGEN
+        0x0000_e005, // b    +10;          (padding)
+        0x0000_c520, // .word 0x0000C520   (WDOG_KEY1)
+        0x0000_d928, // .word 0x0000D928   (WDOG_KEY2)
+        0xbe00_0000, // (align);           bkpt #0               ; halt
+    ];
+
+    const WDOG_BASE: u32 = 0x4005_2000;
+    const ALGO_ADDR: u32 = 0x2000_0000; // Start of SRAM_U (valid on all K20 variants)
+    const DCRDR: u64 = 0xE000_EDF8; // Debug Core Register Data Register
+    const DCRSR: u64 = 0xE000_EDF4; // Debug Core Register Selector Register
+
+    tracing::debug!("Kinetis: disabling WDOG via uploaded algorithm");
+
+    // Verify core is halted and MEM-AP is accessible before proceeding.
+    // After system reset, the MEM-AP may not be ready yet.
+    match core.read_word_32(Dhcsr::get_mmio_address()) {
+        Ok(val) if (val & (1 << 17)) != 0 => {} // S_HALT set — core is halted, proceed
+        Ok(_) => {
+            tracing::debug!("Kinetis WDOG: core not halted, skipping disable");
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::debug!("Kinetis WDOG: MEM-AP not accessible, skipping disable");
+            return Ok(());
+        }
+    }
+
+    // Save current PC so we can restore it after the algorithm
+    core.write_word_32(DCRSR, 15)?; // Request read of R15 (PC)
+    let saved_pc = core.read_word_32(DCRDR)?;
+
+    // Upload algorithm to target RAM (8 words = 32 bytes)
+    for (i, &word) in WDOG_ALGO.iter().enumerate() {
+        core.write_word_32(ALGO_ADDR as u64 + i as u64 * 4, word)?;
+    }
+
+    // Set R0 = WDOG base address
+    core.write_word_32(DCRDR, WDOG_BASE)?;
+    core.write_word_32(DCRSR, (1 << 16) | 0)?; // Write R0
+
+    // Set PC = algorithm start address
+    core.write_word_32(DCRDR, ALGO_ADDR)?;
+    core.write_word_32(DCRSR, (1 << 16) | 15)?; // Write R15 (PC)
+
+    // Resume core — algorithm executes at CPU speed, hits bkpt when done
+    let mut dhcsr = Dhcsr(0);
+    dhcsr.enable_write();
+    dhcsr.set_c_debugen(true);
+    // c_halt defaults to false → core runs
+    core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+
+    // Wait for algorithm to complete (bkpt instruction halts the core)
+    let start = Instant::now();
+    loop {
+        let dhcsr_val = core.read_word_32(Dhcsr::get_mmio_address())?;
+        if (dhcsr_val & (1 << 17)) != 0 {
+            // S_HALT is set — algorithm hit bkpt
+            break;
+        }
+        if start.elapsed() > Duration::from_millis(500) {
+            tracing::warn!("Kinetis WDOG disable: algorithm timeout, force-halting");
+            let mut dhcsr = Dhcsr(0);
+            dhcsr.enable_write();
+            dhcsr.set_c_debugen(true);
+            dhcsr.set_c_halt(true);
+            core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // Restore PC to reset handler
+    core.write_word_32(DCRDR, saved_pc)?;
+    core.write_word_32(DCRSR, (1 << 16) | 15)?; // Write R15 (PC)
+
+    // Verify WDOG is disabled (STCTRLH bit 0 = WDOGEN)
+    let stctrlh = core.read_word_32(WDOG_BASE as u64)?;
+    if (stctrlh & 1) == 0 {
+        tracing::info!("Kinetis WDOG disabled successfully (STCTRLH = {stctrlh:#06x})");
+    } else {
+        tracing::warn!(
+            "Kinetis WDOG disable may have failed (STCTRLH = {stctrlh:#06x})"
+        );
+    }
+
+    Ok(())
+}
+
 impl ArmDebugSequence for Kinetis {
     fn debug_device_unlock(
         &self,
@@ -451,23 +562,20 @@ impl ArmDebugSequence for Kinetis {
             );
         }
 
-        // Check security state (with FREADY gating and multi-read scoring)
+        // Stabilize the system before checking security.
+        // On an unsecured chip in a WDOG reset loop (blank flash), mdm_halt
+        // holds the core via CORE_HOLD_RES so is_secured() can reliably read
+        // SYSSEC. On a secured chip, CORE_HOLD_RES is silently ignored
+        // (Secure=N in MDM Control), but the attempt is harmless — mdm_halt
+        // will timeout on its polls and continue.
+        mdm_halt(iface)?;
+
         if !is_secured(iface)? {
             tracing::info!("Kinetis device is unsecured");
 
-            // Break the WDOG reset loop and put the core in debug halt mode.
-            // This follows OpenOCD's `kinetis mdm halt` + `reset halt` approach:
-            //
-            //   1. mdm_halt() — sets CORE_HOLD_RES, triggers system reset, core is
-            //      held at end of reset sequencing (but NOT in debug halt mode)
-            //   2. Configure debug via MEM-AP — enable C_DEBUGEN in DHCSR and set
-            //      VC_CORERESET in DEMCR (PPB is accessible while core is held)
-            //   3. Release CORE_HOLD_RES — core exits reset, VC_CORERESET catches it
-            //      and puts it in proper debug halt mode (CORE_HALTED=1)
-            //
-            // The first MEM-AP access may fail (WDOG timing), so we retry once.
-            mdm_halt(iface)?;
-
+            // Core is already held by mdm_halt's CORE_HOLD_RES.
+            // Enter proper debug halt mode via MEM-AP (C_DEBUGEN + VC_CORERESET).
+            // First attempt may fail due to timing; retry with fresh mdm_halt.
             if let Err(e) = mdm_enter_debug_halt(self, iface, _default_ap) {
                 tracing::warn!(
                     "Kinetis: first debug halt attempt failed ({e}), retrying mdm_halt"
@@ -527,6 +635,14 @@ impl ArmDebugSequence for Kinetis {
         _debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
         use crate::architecture::arm::core::armv7m::Demcr;
+
+        // Disable the WDOG while the core is halted at the reset vector.
+        // The WDOG is re-enabled on every system reset. Without this, firmware
+        // must disable it within ~1.25s — which requires timing-critical code.
+        // This matches OpenOCD's `kinetis disable_wdog` in the reset-init event.
+        if let Err(e) = disable_wdog(core) {
+            tracing::warn!("Kinetis: WDOG disable failed ({e}), firmware must handle WDOG");
+        }
 
         let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
         demcr.set_vc_corereset(false);
@@ -609,6 +725,8 @@ struct KinetisEraseSequence;
 impl DebugEraseSequence for KinetisEraseSequence {
     fn erase_all(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
         tracing::info!("Kinetis chip erase via MDM-AP");
+        // Stabilize system so is_secured() gets reliable reads
+        mdm_halt(interface)?;
         let secured = is_secured(interface)?;
         kinetis_mass_erase(interface, secured)?;
         Err(ArmError::ReAttachRequired)
