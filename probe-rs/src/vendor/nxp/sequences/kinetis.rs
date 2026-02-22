@@ -104,7 +104,7 @@ fn is_secured(iface: &mut dyn DapAccess) -> Result<bool, ArmError> {
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         "Kinetis security score: {secured_count}/{valid_count} valid reads show SYSSEC"
     );
 
@@ -134,7 +134,7 @@ fn is_secured(iface: &mut dyn DapAccess) -> Result<bool, ArmError> {
 fn mdm_halt(iface: &mut dyn DapAccess) -> Result<(), ArmError> {
     let mdm_ap = &MDM_AP;
 
-    tracing::info!("Kinetis: performing MDM halt (CORE_HOLD_RES + system reset)");
+    tracing::debug!("Kinetis: performing MDM halt (CORE_HOLD_RES + system reset)");
 
     // Step 1: Set CORE_HOLD_RES
     iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_CORE_HOLD_RES)?;
@@ -183,7 +183,7 @@ fn mdm_halt(iface: &mut dyn DapAccess) -> Result<(), ArmError> {
     loop {
         let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
         if (status & MDM_STAT_CORE_HALTED) != 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Kinetis MDM halt: core halted at reset vector (status: {status:#010x})"
             );
             break;
@@ -226,7 +226,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
 
     // Pre-check: verify mass erase is enabled
     let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
-    tracing::warn!("Kinetis mass erase: initial MDM Status = {status:#010x}");
+    tracing::debug!("Kinetis mass erase: initial MDM Status = {status:#010x}");
 
     if (status & MDM_STAT_FMEEN) == 0 {
         return Err(ArmDebugSequenceError::custom(
@@ -244,7 +244,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         let fready = (status & MDM_STAT_FREADY) != 0;
         let not_in_reset = (status & MDM_STAT_SYSRES) != 0;
         if fready && not_in_reset {
-            tracing::warn!("Kinetis mass erase: system ready (status: {status:#010x})");
+            tracing::debug!("Kinetis mass erase: system ready (status: {status:#010x})");
             break;
         }
         if start.elapsed() > Duration::from_secs(5) {
@@ -261,12 +261,12 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         // On a secured chip, only FMEIP (bit 0) is writable in MDM Control.
         // SYS_RES_REQ and CORE_HOLD_RES are NOT writable (Secure=N).
         // Write FMEIP immediately to maximize time before next WDOG reset.
-        tracing::warn!("Kinetis mass erase: starting erase (FMEIP only — secured chip)");
+        tracing::info!("Kinetis mass erase: starting erase (FMEIP only — secured chip)");
         iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_FMEIP)?;
     } else {
         // On an unsecured chip, assert SYS_RES_REQ to hold the system in reset
         // and prevent WDOG from interfering with the erase.
-        tracing::warn!("Kinetis mass erase: asserting system reset + FMEIP");
+        tracing::info!("Kinetis mass erase: starting erase (SYS_RES_REQ + FMEIP)");
         iface.write_raw_ap_register(
             mdm_ap,
             MDM_CONTROL,
@@ -277,7 +277,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
     // Verify FMEIP was accepted by reading back the control register.
     let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
     let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
-    tracing::warn!(
+    tracing::debug!(
         "Kinetis mass erase: after write — ctrl={control:#010x}, status={status:#010x}"
     );
 
@@ -300,7 +300,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
     loop {
         let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
         if (control & MDM_CTRL_FMEIP) == 0 {
-            tracing::warn!(
+            tracing::info!(
                 "Kinetis mass erase complete (took {}ms)",
                 start.elapsed().as_millis()
             );
@@ -310,7 +310,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         if last_log.elapsed() > Duration::from_secs(2) {
             let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
             let fmeack = if (status & MDM_STAT_FMEACK) != 0 { "yes" } else { "no" };
-            tracing::warn!(
+            tracing::info!(
                 "Kinetis mass erase: waiting — ctrl={control:#010x}, \
                  status={status:#010x}, FMEACK={fmeack}, elapsed={}ms",
                 start.elapsed().as_millis()
@@ -332,7 +332,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
         // Unsecured chip: transition to CORE_HOLD_RES before releasing SYS_RES_REQ.
         // This holds the core at the reset vector, preventing the WDOG/reset loop
         // that would otherwise occur with blank flash.
-        tracing::warn!("Kinetis mass erase: setting CORE_HOLD_RES before releasing reset");
+        tracing::debug!("Kinetis mass erase: setting CORE_HOLD_RES before releasing reset");
         iface.write_raw_ap_register(
             mdm_ap,
             MDM_CONTROL,
@@ -351,7 +351,7 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
     loop {
         let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
         if (status & MDM_STAT_SYSRES) != 0 {
-            tracing::warn!("Kinetis mass erase: system out of reset (status: {status:#010x})");
+            tracing::debug!("Kinetis mass erase: system out of reset (status: {status:#010x})");
             break;
         }
         if start.elapsed() > Duration::from_secs(2) {
@@ -383,7 +383,7 @@ fn mdm_enter_debug_halt(
 ) -> Result<(), ArmError> {
     use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
 
-    tracing::info!("Kinetis: configuring debug halt via MEM-AP");
+    tracing::debug!("Kinetis: configuring debug halt via MEM-AP");
 
     // Access PPB via MEM-AP to configure debug registers.
     // With CORE_HOLD_RES active, the system is out of reset (SYSRES=1)
@@ -416,7 +416,7 @@ fn mdm_enter_debug_halt(
     loop {
         let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
         if (status & MDM_STAT_CORE_HALTED) != 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Kinetis: core in debug halt mode (status: {status:#010x})"
             );
             return Ok(());
@@ -534,7 +534,7 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     // Verify WDOG is disabled (STCTRLH bit 0 = WDOGEN)
     let stctrlh = core.read_word_32(WDOG_BASE as u64)?;
     if (stctrlh & 1) == 0 {
-        tracing::info!("Kinetis WDOG disabled successfully (STCTRLH = {stctrlh:#06x})");
+        tracing::debug!("Kinetis WDOG disabled successfully (STCTRLH = {stctrlh:#06x})");
     } else {
         tracing::warn!(
             "Kinetis WDOG disable may have failed (STCTRLH = {stctrlh:#06x})"
@@ -555,7 +555,7 @@ impl ArmDebugSequence for Kinetis {
 
         // Verify MDM-AP identity
         let mdm_idr = iface.read_raw_ap_register(mdm_ap, MDM_IDR)?;
-        tracing::info!("Kinetis MDM-AP IDR: {mdm_idr:#010x}");
+        tracing::debug!("Kinetis MDM-AP IDR: {mdm_idr:#010x}");
         if mdm_idr != K_SERIES_MDM_ID {
             tracing::warn!(
                 "Unexpected MDM-AP IDR: {mdm_idr:#010x} (expected {K_SERIES_MDM_ID:#010x})"
@@ -601,7 +601,7 @@ impl ArmDebugSequence for Kinetis {
         // a re-attach — on reconnect, the chip should report as unsecured if the erase
         // succeeded (the "mass erase done" flag persists across warm resets, only cleared
         // by POR).
-        tracing::warn!("Kinetis mass erase done. Re-attaching probe.");
+        tracing::info!("Kinetis mass erase done, re-attaching probe");
         Err(ArmError::ReAttachRequired)
     }
 
@@ -641,7 +641,7 @@ impl ArmDebugSequence for Kinetis {
         // must disable it within ~1.25s — which requires timing-critical code.
         // This matches OpenOCD's `kinetis disable_wdog` in the reset-init event.
         if let Err(e) = disable_wdog(core) {
-            tracing::warn!("Kinetis: WDOG disable failed ({e}), firmware must handle WDOG");
+            tracing::debug!("Kinetis: WDOG disable skipped ({e}), firmware must handle WDOG");
         }
 
         let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
