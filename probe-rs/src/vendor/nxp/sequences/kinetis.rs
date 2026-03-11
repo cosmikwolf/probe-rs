@@ -233,64 +233,148 @@ fn mdm_halt(iface: &mut dyn DapAccess) -> Result<(), ArmError> {
 
 /// Perform mass erase via MDM-AP FMEIP. See AN4835 Section 4.2.1.
 ///
-/// On secured chips, only FMEIP is writable (Table 9-5). On unsecured chips,
-/// SYS_RES_REQ is asserted first to prevent WDOG interference. After erase,
-/// the flash controller's "mass erase done" flag overrides FSEC security until POR.
-fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), ArmError> {
-    let mdm_ap = &MDM_AP;
+/// Asserts hardware nRST to hold the system in stable reset, breaking any
+/// lockup/WDOG reset loop. While held, the flash controller still initializes
+/// (FREADY=1 with SYSRES=0 — ref manual Section 9.5.2). Once FREADY is stable
+/// for 32 consecutive reads, FMEIP is written with nRST still held. The erase
+/// completes under reset; nRST is released only after FMEIP clears.
+///
+/// On secured chips, only FMEIP is writable in MDM Control (Table 9-5) —
+/// SYS_RES_REQ, CORE_HOLD_RES, and DBG_REQ are all ignored. Hardware nRST is
+/// the only way to stabilize a secured chip in a lockup loop.
+///
+/// Follows the proven OpenOCD `kinetis_mdm_mass_erase` sequence.
+fn kinetis_mass_erase(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+    use crate::architecture::arm::traits::Pins;
 
-    let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
-    tracing::debug!("Kinetis mass erase: initial MDM Status = {status:#010x}");
+    let mdm_ap = &MDM_AP;
+    let n_reset_mask = {
+        let mut p = Pins(0);
+        p.set_nreset(true);
+        p.0 as u32
+    };
+
+    // --- Step 1: Assert hardware nRST ---
+    tracing::debug!("Kinetis mass erase: asserting nRST");
+    match iface.swj_pins(0, n_reset_mask, 0) {
+        Ok(pins) => tracing::debug!("Kinetis mass erase: nRST asserted (pins={pins:#010x})"),
+        Err(e) => {
+            tracing::warn!("Kinetis mass erase: swj_pins not supported ({e}), trying without nRST");
+            return kinetis_mass_erase_no_nrst(iface);
+        }
+    }
+
+    // Let the system settle in reset. The flash controller initializes
+    // independently and will report FREADY=1 while the system is held in reset.
+    thread::sleep(Duration::from_millis(100));
+
+    // Write SYS_RES_REQ for good measure (matches OpenOCD; ignored on secured chips).
+    let _ = iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ);
+
+    // --- Step 2: Verify MDM-AP is accessible and check FMEEN ---
+    let status = match iface.read_raw_ap_register(mdm_ap, MDM_STATUS) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Kinetis mass erase: cannot read MDM Status while nRST held ({e})");
+            let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
+            return Err(e);
+        }
+    };
+    tracing::debug!("Kinetis mass erase: MDM Status while nRST held = {status:#010x}");
 
     if (status & MDM_STAT_FMEEN) == 0 {
+        let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
         return Err(ArmDebugSequenceError::custom(
             "Kinetis mass erase is disabled (FMEEN=0). Device may be permanently locked.",
         )
         .into());
     }
 
+    // --- Step 3: Wait for FREADY=1 + SYSRES=0 (flash ready while in reset) ---
+    // 32 consecutive matching reads required for stability, matching OpenOCD.
     let start = Instant::now();
+    let mut ready_count = 0u32;
+    let mut last_log = Instant::now();
+
     loop {
         let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
         let fready = (status & MDM_STAT_FREADY) != 0;
-        let not_in_reset = (status & MDM_STAT_SYSRES) != 0;
-        if fready && not_in_reset {
-            tracing::debug!("Kinetis mass erase: system ready (status: {status:#010x})");
+        let in_reset = (status & MDM_STAT_SYSRES) == 0;
+
+        if fready && in_reset {
+            ready_count += 1;
+        } else {
+            if ready_count > 0 {
+                tracing::debug!(
+                    "Kinetis mass erase: FREADY/SYSRES unstable, resetting count \
+                     (was {ready_count}, status={status:#010x})"
+                );
+            }
+            ready_count = 0;
+        }
+
+        if ready_count >= 32 {
+            tracing::debug!("Kinetis mass erase: FREADY stable for 32 reads");
             break;
         }
+
+        if last_log.elapsed() > Duration::from_secs(1) {
+            tracing::debug!(
+                "Kinetis mass erase: waiting for FREADY — status={status:#010x}, \
+                 ready_count={ready_count}, elapsed={}ms",
+                start.elapsed().as_millis()
+            );
+            last_log = Instant::now();
+        }
+
         if start.elapsed() > Duration::from_secs(5) {
-            return Err(ArmDebugSequenceError::custom(format!(
-                "Kinetis flash not ready or system stuck in reset (status: {status:#010x}). \
-                 Cannot perform mass erase.",
-            ))
+            tracing::error!(
+                "Kinetis mass erase: FREADY not stable after 5s while nRST held \
+                 (status={status:#010x}, ready_count={ready_count})"
+            );
+            let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
+            return Err(ArmDebugSequenceError::custom(
+                "Kinetis: flash controller not ready while nRST held. \
+                 Check probe nRST connection.",
+            )
             .into());
         }
-        thread::sleep(Duration::from_millis(10));
     }
 
-    if secured {
-        tracing::info!("Kinetis mass erase: starting erase (FMEIP only — secured chip)");
-        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_FMEIP)?;
-    } else {
-        tracing::info!("Kinetis mass erase: starting erase (SYS_RES_REQ + FMEIP)");
-        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP)?;
-    }
+    // --- Step 4: Write FMEIP (with SYS_RES_REQ, matching OpenOCD) ---
+    tracing::debug!("Kinetis mass erase: writing SYS_RES_REQ | FMEIP");
+    iface.write_raw_ap_register(
+        mdm_ap,
+        MDM_CONTROL,
+        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP,
+    )?;
 
     let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
-    let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
-    tracing::debug!(
-        "Kinetis mass erase: after write — ctrl={control:#010x}, status={status:#010x}"
-    );
-
     if (control & MDM_CTRL_FMEIP) == 0 {
-        return Err(ArmDebugSequenceError::custom(
-            "Kinetis: FMEIP not set after write — mass erase request was rejected",
-        )
-        .into());
+        // Try writing just FMEIP (maybe SYS_RES_REQ interferes on secured chips)
+        tracing::debug!(
+            "Kinetis mass erase: FMEIP not set with SYS_RES_REQ (ctrl={control:#010x}), \
+             retrying with FMEIP only"
+        );
+        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_FMEIP)?;
+        let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
+        if (control & MDM_CTRL_FMEIP) == 0 {
+            tracing::error!(
+                "Kinetis mass erase: FMEIP not accepted (ctrl={control:#010x})"
+            );
+            let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
+            return Err(ArmDebugSequenceError::custom(
+                "Kinetis: FMEIP write rejected while nRST held and FREADY=1. \
+                 This should not happen — check hardware.",
+            )
+            .into());
+        }
     }
 
-    // Poll FMEIP (not FMEACK — FMEACK is cleared by system resets, unreliable on
-    // secured chips in a WDOG reset loop). 16s timeout per OpenOCD.
+    tracing::info!("Kinetis mass erase: FMEIP accepted, erase in progress");
+
+    // --- Step 5: Poll FMEIP=0 (erase complete), nRST still held ---
+    // 16s timeout per OpenOCD (3.6s per 512kB block, 4 blocks max).
     let start = Instant::now();
     let timeout = Duration::from_secs(16);
     let mut last_log = Instant::now();
@@ -322,29 +406,173 @@ fn kinetis_mass_erase(iface: &mut dyn DapAccess, secured: bool) -> Result<(), Ar
             tracing::error!(
                 "Timeout waiting for mass erase — ctrl={control:#010x}, status={status:#010x}"
             );
+            let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
             return Err(ArmError::Timeout);
         }
         thread::sleep(Duration::from_millis(50));
     }
 
-    if !secured {
-        // Hold core before releasing reset to prevent WDOG loop on blank flash.
-        iface.write_raw_ap_register(
-            mdm_ap,
-            MDM_CONTROL,
-            MDM_CTRL_SYS_RES_REQ | MDM_CTRL_CORE_HOLD_RES,
-        )?;
-        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_CORE_HOLD_RES)?;
-    } else {
-        iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, 0)?;
+    // --- Step 6: Post-erase — ensure unsecured, hold core, release nRST ---
+    // nRST is still held. The "mass erase done" flag should override FSEC security,
+    // but the MDM-AP may not reflect the new security state until a reset cycle.
+    thread::sleep(Duration::from_millis(100));
+
+    let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
+    let still_secured = (status & MDM_STAT_SYSSEC) != 0;
+    tracing::info!(
+        "Kinetis: post-erase MDM Status = {status:#010x}, SYSSEC={}",
+        if still_secured { "still secured" } else { "unsecured" }
+    );
+
+    if still_secured {
+        // Security override needs a reset cycle. Briefly release nRST to let the
+        // system reset, then re-assert to prevent lockup on blank flash.
+        tracing::debug!("Kinetis: cycling nRST for security override to take effect");
+        let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0); // release
+        thread::sleep(Duration::from_millis(10));
+        let _ = iface.swj_pins(0, n_reset_mask, 0); // re-assert
+        thread::sleep(Duration::from_millis(100));
+
+        let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
+        tracing::info!(
+            "Kinetis: post-nRST-cycle MDM Status = {status:#010x}, SYSSEC={}",
+            if (status & MDM_STAT_SYSSEC) != 0 { "still secured!" } else { "unsecured" }
+        );
     }
 
-    thread::sleep(Duration::from_millis(100));
+    // Chip should be unsecured now — CORE_HOLD_RES and SYS_RES_REQ should work.
+    // Set CORE_HOLD_RES + SYS_RES_REQ to hold the core when reset exits.
+    iface.write_raw_ap_register(
+        mdm_ap,
+        MDM_CONTROL,
+        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_CORE_HOLD_RES,
+    )?;
+
+    // Verify the control bits were accepted (they're ignored if still secured).
+    let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
+    if (control & MDM_CTRL_CORE_HOLD_RES) == 0 {
+        tracing::warn!(
+            "Kinetis: CORE_HOLD_RES not accepted (ctrl={control:#010x}). \
+             Core may enter lockup on blank flash after reset."
+        );
+    } else {
+        tracing::debug!("Kinetis: CORE_HOLD_RES accepted (ctrl={control:#010x})");
+    }
+
+    // Release nRST — SYS_RES_REQ keeps the system in reset.
+    tracing::debug!("Kinetis mass erase: releasing nRST");
+    let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
+    thread::sleep(Duration::from_millis(10));
+
+    // Release SYS_RES_REQ, keeping CORE_HOLD_RES — core is suspended at reset vector.
+    iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_CORE_HOLD_RES)?;
+
     let start = Instant::now();
     loop {
         let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
         if (status & MDM_STAT_SYSRES) != 0 {
-            tracing::debug!("Kinetis mass erase: system out of reset (status: {status:#010x})");
+            tracing::debug!(
+                "Kinetis mass erase: system out of reset, core held (status: {status:#010x})"
+            );
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            tracing::warn!(
+                "Kinetis mass erase: timeout waiting for reset exit (status: {status:#010x})"
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Ok(())
+}
+
+/// Fallback mass erase without hardware nRST (for probes without reset line).
+///
+/// Uses SYS_RES_REQ to hold the system in reset. This only works on unsecured
+/// chips (or chips where SYS_RES_REQ is functional). On secured chips in a
+/// lockup loop, this will fail — hardware nRST is required.
+fn kinetis_mass_erase_no_nrst(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
+    let mdm_ap = &MDM_AP;
+
+    let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
+    tracing::debug!("Kinetis mass erase (no nRST): MDM Status = {status:#010x}");
+
+    if (status & MDM_STAT_FMEEN) == 0 {
+        return Err(ArmDebugSequenceError::custom(
+            "Kinetis mass erase is disabled (FMEEN=0). Device may be permanently locked.",
+        )
+        .into());
+    }
+
+    // Try SYS_RES_REQ to hold system in reset (ignored on secured chips).
+    iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ)?;
+    thread::sleep(Duration::from_millis(100));
+
+    // Wait for FREADY=1 + SYSRES=0.
+    let start = Instant::now();
+    let mut ready_count = 0u32;
+    loop {
+        let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
+        let fready = (status & MDM_STAT_FREADY) != 0;
+        let in_reset = (status & MDM_STAT_SYSRES) == 0;
+
+        if fready && in_reset {
+            ready_count += 1;
+        } else {
+            ready_count = 0;
+        }
+
+        if ready_count >= 32 {
+            break;
+        }
+
+        if start.elapsed() > Duration::from_secs(3) {
+            return Err(ArmDebugSequenceError::custom(
+                "Kinetis: flash not ready for mass erase. If device is secured \
+                 and in a reset loop, hardware nRST is required.",
+            )
+            .into());
+        }
+    }
+
+    iface.write_raw_ap_register(
+        mdm_ap,
+        MDM_CONTROL,
+        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP,
+    )?;
+
+    // Poll FMEIP=0.
+    let start = Instant::now();
+    loop {
+        let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
+        if (control & MDM_CTRL_FMEIP) == 0 {
+            tracing::info!(
+                "Kinetis mass erase complete (took {}ms)",
+                start.elapsed().as_millis()
+            );
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(16) {
+            return Err(ArmError::Timeout);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Post-erase: hold core at reset vector.
+    iface.write_raw_ap_register(
+        mdm_ap,
+        MDM_CONTROL,
+        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_CORE_HOLD_RES,
+    )?;
+    iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_CORE_HOLD_RES)?;
+    thread::sleep(Duration::from_millis(100));
+
+    let start = Instant::now();
+    loop {
+        let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
+        if (status & MDM_STAT_SYSRES) != 0 {
             break;
         }
         if start.elapsed() > Duration::from_secs(2) {
@@ -480,7 +708,7 @@ impl ArmDebugSequence for Kinetis {
             .erase_all()
             .map_err(|MissingPermissions(desc)| ArmError::MissingPermissions(desc))?;
 
-        kinetis_mass_erase(iface, true)?;
+        kinetis_mass_erase(iface)?;
 
         // Re-attach required — SYSSEC is unreliable immediately after erase.
         // On reconnect, the "mass erase done" flag keeps the chip unsecured.
@@ -590,9 +818,7 @@ struct KinetisEraseSequence;
 impl DebugEraseSequence for KinetisEraseSequence {
     fn erase_all(&self, interface: &mut dyn ArmDebugInterface) -> Result<(), ArmError> {
         tracing::info!("Kinetis chip erase via MDM-AP");
-        mdm_halt(interface)?;
-        let secured = is_secured(interface)?;
-        kinetis_mass_erase(interface, secured)?;
+        kinetis_mass_erase(interface)?;
         Err(ArmError::ReAttachRequired)
     }
 }
