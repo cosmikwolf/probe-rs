@@ -5,10 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::probe::{
+use probe_rs::probe::{
     DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError, ProbeError,
-    espusbjtag::EspUsbJtagFactory, usb_util::InterfaceExt,
+    usb_util::InterfaceExt,
 };
+
+use super::EspUsbJtagFactory;
 
 const JTAG_PROTOCOL_CAPABILITIES_VERSION: u8 = 1;
 const JTAG_PROTOCOL_CAPABILITIES_SPEED_APB_TYPE: u8 = 1;
@@ -19,7 +21,7 @@ const MAX_COMMAND_REPETITIONS: usize = 1023;
 const OUT_EP_BUFFER_SIZE: usize = 64;
 const IN_EP_BUFFER_SIZE: usize = 64;
 const HW_FIFO_SIZE: usize = 4;
-const USB_TIMEOUT: Duration = Duration::from_millis(5000);
+const USB_TIMEOUT: Duration = Duration::from_millis(500);
 const USB_DEVICE_CLASS: u8 = 0xFF;
 const USB_DEVICE_SUBCLASS: u8 = 0xFF;
 const USB_DEVICE_PROTOCOL: u8 = 0x01;

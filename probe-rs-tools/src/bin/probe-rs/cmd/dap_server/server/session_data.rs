@@ -3,6 +3,7 @@ use super::{
     core_data::{CoreData, CoreHandle},
 };
 use crate::{
+    FormatKind,
     cmd::{
         dap_server::{
             DebuggerError,
@@ -25,7 +26,6 @@ use anyhow::{Result, anyhow};
 use probe_rs::{
     BreakpointCause, CoreStatus, HaltReason, Session, VectorCatchCondition,
     config::{Registry, TargetSelector},
-    flashing::FormatKind,
     probe::list::Lister,
     rtt::{ScanRegion, find_rtt_control_block_in_raw_file},
 };
@@ -247,7 +247,8 @@ impl SessionData {
         let image_format = config
             .flashing_config
             .format_options
-            .to_format_kind(self.session.target());
+            .binary_format
+            .resolve(self.session.target());
 
         for core_configuration in valid_core_configs {
             let Some(core_data) = self
@@ -434,7 +435,9 @@ impl SessionData {
             // By setting it here, we ensure that RTT will be checked at least once after the core has halted.
             if !current_core_status.is_halted() {
                 debug_adapter.all_cores_halted = false;
-            } else if !cores_halted_previously {
+            } else if !cores_halted_previously
+                && let Some(debug_info) = target_core.core_data.debug_info.as_ref()
+            {
                 // If currently halted, and was previously running
                 // update the stack frames
                 let _stackframe_span = tracing::debug_span!("Update Stack Frames").entered();
@@ -449,10 +452,10 @@ impl SessionData {
 
                 if target_core.core_data.static_variables.is_none() {
                     target_core.core_data.static_variables =
-                        Some(target_core.core_data.debug_info.create_static_scope_cache());
+                        Some(debug_info.create_static_scope_cache());
                 }
 
-                target_core.core_data.stack_frames = target_core.core_data.debug_info.unwind(
+                target_core.core_data.stack_frames = debug_info.unwind(
                     &mut target_core.core,
                     initial_registers,
                     exception_interface.as_ref(),
@@ -485,13 +488,12 @@ impl SessionData {
     }
 }
 
-fn debug_info_from_binary(core_configuration: &CoreConfig) -> anyhow::Result<DebugInfo> {
+fn debug_info_from_binary(core_configuration: &CoreConfig) -> anyhow::Result<Option<DebugInfo>> {
     let Some(ref binary_path) = core_configuration.program_binary else {
-        return Err(anyhow!(
-            "Please provide a valid `program_binary` for debug core: {}",
-            core_configuration.core_index
-        ));
+        return Ok(None);
     };
 
-    DebugInfo::from_file(binary_path).map_err(|error| anyhow!(error))
+    DebugInfo::from_file(binary_path)
+        .map_err(|error| anyhow!(error))
+        .map(Some)
 }
