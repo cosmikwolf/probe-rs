@@ -14,9 +14,37 @@
 //!   exits reset, allowing SWD access to flash and RAM before any code executes.
 //!   Does NOT set DHCSR.S_HALT (that requires C_DEBUGEN + VC_CORERESET).
 //!
-//! The WDOG starts with a ~1.25s timeout from every system reset. The unlock
-//! sequence (two writes to WDOG_UNLOCK within 20 bus cycles) is too fast for
-//! SWD, so we upload a 32-byte Thumb routine to SRAM and execute it at CPU speed.
+//! # The WDOG and the 256-cycle rule
+//!
+//! The WDOG is enabled out of every system reset, and K20 RM §23.3.2 requires
+//! the firmware to *unlock* it within WCT (256 bus clock cycles) of that reset,
+//! "failing which the WDOG issues a reset to the system". A firmware that
+//! copies `.data` and zeroes `.bss` before touching the WDOG never makes it:
+//! measured on a MK20DX256 on 2026-09-10, such a firmware WDOG-resets about
+//! 20,000 times a second and is in reset ~78% of the time. From the probe that
+//! looks like AP 0 answering FAULT at random (`DRW` at 0xd0c) while the DP and
+//! the MDM-AP work perfectly, at attach and at shutdown alike. It is not a
+//! probe or sequence defect; `RCM_SRS0 = 0x20` names the cause.
+//!
+//! RM §23.5 suspends the rule while the core is halted ("entry into Debug mode
+//! within WCT after reset ... no need to unlock") and re-arms it on resume
+//! ("the WDOG timer restarts and has to be unlocked and configured within
+//! WCT"). Two consequences for this sequence:
+//!
+//! - Any code this sequence runs on the target after a reset (the flash
+//!   algorithm included) is subject to the rule, so the WDOG has to be
+//!   disabled first. That is what `disable_wdog` is for, and why jlinkexe and
+//!   OpenOCD both carry the same step.
+//! - A `Session::attach` that disables the WDOG **hides the firmware bug**:
+//!   under probe-rs the firmware boots and runs, standalone it never reaches
+//!   `main`. When a Kinetis target "only works with the debugger attached", or
+//!   fails MEM-AP transfers intermittently, check `RCM_SRS0` before suspecting
+//!   the debug sequence. Reading it needs the MDM-AP CORE_HOLD_RES control bit armed and a
+//!   wait for the firmware's own next reset; a plain MEM-AP read fails.
+//!
+//! The unlock itself (two writes to WDOG_UNLOCK within 20 bus cycles) is too
+//! fast for SWD, so `disable_wdog` uploads a 32-byte Thumb routine to SRAM and
+//! executes it at CPU speed.
 //!
 //! Reference: K20 Sub-Family Reference Manual (K20P64M72SF1RM), OpenOCD kinetis.c,
 //! AN4835 "Production Flash Programming Best Practices for Kinetis K- and L-series".
@@ -587,6 +615,12 @@ fn kinetis_mass_erase_no_nrst(iface: &mut dyn ArmDebugInterface) -> Result<(), A
 ///
 /// The WDOG unlock requires two writes within 20 bus cycles — too fast for SWD.
 /// Core must be halted. Based on OpenOCD's `armv7m_kinetis_wdog.s`.
+///
+/// Why this exists at all: see the module docs on the 256-cycle rule. Known
+/// limits as of 2026-09-10: the routine is staged at `ALGO_ADDR` (0x2000_0000,
+/// SRAM_U base) over live firmware RAM and is not restored, and it is only
+/// reached from `reset_catch_clear`, so an attach that does not go through
+/// `reset_and_halt` leaves the WDOG enabled.
 fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     use crate::architecture::arm::core::armv7m::Dhcsr;
 
