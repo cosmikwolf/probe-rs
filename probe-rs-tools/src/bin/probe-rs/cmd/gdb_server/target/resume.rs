@@ -1,22 +1,21 @@
 use super::{ResumeAction, RuntimeTarget};
+use probe_rs_rpc::core_ops::WireSteppingMode;
 
 use gdbstub::target::ext::base::multithread::MultiThreadSingleStepOps;
 use gdbstub::target::ext::base::multithread::{MultiThreadResume, MultiThreadSingleStep};
 
-impl MultiThreadResume for RuntimeTarget<'_> {
+impl MultiThreadResume for RuntimeTarget {
     fn resume(&mut self) -> Result<(), Self::Error> {
-        let mut session = self.session.lock();
-
         match self.resume_action {
             (_, ResumeAction::Resume) => {
-                for core_id in self.cores.iter() {
-                    let mut core = session.core(*core_id)?;
-                    core.run()?;
-                }
+                let cores = self.cores.iter().map(|core| core.index as u32).collect();
+                self.block_on(self.session.resume_cores(Some(cores)))?;
             }
             (core_id, ResumeAction::Step) => {
-                let mut core = session.core(core_id)?;
-                core.step()?;
+                self.block_on(
+                    self.session
+                        .debug_step(core_id as u32, WireSteppingMode::StepInstruction),
+                )?;
             }
             (_, ResumeAction::Unchanged) => {}
         }
@@ -26,7 +25,6 @@ impl MultiThreadResume for RuntimeTarget<'_> {
 
     fn clear_resume_actions(&mut self) -> Result<(), Self::Error> {
         self.resume_action = (0, ResumeAction::Resume);
-
         Ok(())
     }
 
@@ -37,7 +35,6 @@ impl MultiThreadResume for RuntimeTarget<'_> {
     ) -> Result<(), Self::Error> {
         let core_id = tid.get() - 1;
         self.resume_action = (core_id, ResumeAction::Resume);
-
         Ok(())
     }
 
@@ -46,7 +43,7 @@ impl MultiThreadResume for RuntimeTarget<'_> {
     }
 }
 
-impl MultiThreadSingleStep for RuntimeTarget<'_> {
+impl MultiThreadSingleStep for RuntimeTarget {
     fn set_resume_action_step(
         &mut self,
         tid: gdbstub::common::Tid,
@@ -54,7 +51,6 @@ impl MultiThreadSingleStep for RuntimeTarget<'_> {
     ) -> Result<(), Self::Error> {
         let core_id = tid.get() - 1;
         self.resume_action = (core_id, ResumeAction::Step);
-
         Ok(())
     }
 }

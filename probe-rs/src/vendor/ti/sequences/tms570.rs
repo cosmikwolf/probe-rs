@@ -6,15 +6,15 @@
 //! then clearing memory using platform-specific register writes.
 use super::icepick::{DefaultProtocol, Icepick};
 use crate::MemoryMappedRegister;
-use crate::architecture::arm::armv7a::{
+use crate::architecture::arm::armv7ar::{
     clear_hw_breakpoint, core_halted, get_hw_breakpoint, read_word_32, request_halt, run,
     set_hw_breakpoint, wait_for_core_halted, write_word_32,
 };
-use crate::architecture::arm::core::armv7a_debug_regs::Dbgdscr;
+use crate::architecture::arm::core::armv7ar_debug_regs::Dbgdscr;
 use crate::architecture::arm::dp::{DebugPortError, DpAddress};
 use crate::architecture::arm::memory::ArmMemoryInterface;
 use crate::architecture::arm::sequences::{ArmDebugSequence, ArmDebugSequenceError};
-use crate::architecture::arm::{ArmError, DapProbe, Pins};
+use crate::architecture::arm::{ArmError, Pins, traits::DebugPortWire};
 use crate::probe::WireProtocol;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -47,7 +47,7 @@ struct TemporaryCore<'a> {
     base_address: u64,
 }
 
-/// A temporary copy of the Armv7a object that is used to manipulate the target
+/// A temporary copy of the Armv7ar object that is used to manipulate the target
 /// without maintaining a long-term view of the object.
 impl<'a> TemporaryCore<'a> {
     pub fn new(memory: &'a mut dyn ArmMemoryInterface, base_address: u64) -> Self {
@@ -158,7 +158,7 @@ impl TMS570 {
     }
 }
 
-fn ensure_ntrst(interface: &mut dyn DapProbe, nrst: bool) -> Result<(), ArmError> {
+fn ensure_ntrst(interface: &mut dyn DebugPortWire, nrst: bool) -> Result<(), ArmError> {
     let mut pin_mask = Pins(0);
     pin_mask.set_ntrst(true);
     pin_mask.set_nreset(nrst);
@@ -167,7 +167,7 @@ fn ensure_ntrst(interface: &mut dyn DapProbe, nrst: bool) -> Result<(), ArmError
     pin_value.set_ntrst(true);
     pin_value.set_nreset(true);
 
-    let _ = interface.swj_pins(pin_value.0.into(), pin_mask.0.into(), 0)?;
+    let _ = interface.swj_pins(pin_value, pin_mask, Duration::ZERO)?;
     Ok(())
 }
 
@@ -197,7 +197,7 @@ fn clear_ecc_memory(core: &mut TemporaryCore) -> Result<(), ArmError> {
 }
 
 impl ArmDebugSequence for TMS570 {
-    fn reset_hardware_assert(&self, interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+    fn reset_hardware_assert(&self, interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
         // Only toggle nRST. This is because the ICEPICK is completely nonresponsive
         // under nRST. It does, however, reset the system. Note that this will not
         // succeed, but the next time `probe-rs` is run the target will have been
@@ -299,7 +299,7 @@ impl ArmDebugSequence for TMS570 {
 
     fn debug_port_setup(
         &self,
-        interface: &mut dyn DapProbe,
+        interface: &mut dyn DebugPortWire,
         _dp: DpAddress,
     ) -> Result<(), ArmError> {
         ensure_ntrst(interface, true)?;

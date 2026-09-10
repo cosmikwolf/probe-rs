@@ -1,19 +1,16 @@
 //! CLI-specific building blocks.
 
-use std::fmt::Display;
 use std::future::pending;
 use std::io::Write;
+use std::time::Duration;
 use std::{future::Future, ops::DerefMut, path::Path, time::Instant};
 
 use anyhow::Context;
 use libtest_mimic::{Failed, Trial};
-use postcard_rpc::host_client::HostClient;
-use postcard_schema::Schema;
-use probe_rs::rtt::{self, find_rtt_control_block_in_raw_file};
+use probe_rs::meta::ElfMetadata;
+use probe_rs::rtt::find_rtt_control_block_and_metadata_in_raw_file;
 use ratatui::crossterm::style::Stylize;
 use rustyline_async::{Readline, ReadlineError, ReadlineEvent, SharedWriter};
-use serde::de::DeserializeOwned;
-use std::env::VarError;
 use time::UtcOffset;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::futures::Notified;
@@ -23,42 +20,56 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cmd::run::{EmbeddedTestElfInfo, MonitoringOptions};
 use crate::rpc::Key;
-use crate::rpc::functions::monitor::{ChannelInfo, MonitorExitReason};
-use crate::rpc::utils::semihosting::SemihostingOptions;
-use crate::{
-    FormatOptions,
-    rpc::{
-        client::{MultiSubscribeError, MultiSubscription, MultiTopic, RpcClient, SessionInterface},
-        functions::{
-            CancelTopic, RttTopic, SemihostingTopic,
-            flash::{BootInfo, DownloadOptions, FlashLayout, ProgressEvent, VerifyResult},
-            monitor::{MonitorMode, MonitorOptions, RttEvent, SemihostingEvent},
-            probe::{
-                AttachRequest, AttachResult, DebugProbeEntry, DebugProbeSelector, SelectProbeResult,
-            },
-            rtt_client::ScanRegion,
-            stack_trace::StackTrace,
-            test::{Test, TestResult},
-        },
-    },
-    util::{
-        common_options::{BinaryDownloadOptions, ProbeOptions},
-        flash::CliProgressBars,
-        logging,
-        rtt::{
-            DefmtProcessor, DefmtState, RttChannelConfig, RttDataHandler, RttDecoder,
-            client::RttClient,
-        },
+use crate::rpc::RttClient;
+use crate::rpc::functions::probe::convert::{
+    from_wire_debug_probe_selector, to_wire_debug_probe_selector, to_wire_protocol,
+};
+use crate::rpc::utils::run_loop::VectorCatchConfig;
+use crate::util::pwr::power_reset;
+use crate::util::{
+    common_options::{BinaryDownloadOptions, ProbeOptions},
+    flash::CliProgressBars,
+    logging,
+    rtt::{DefmtProcessor, DefmtState, RttDecoder},
+    style::{
+        Prompt, StackTraceAddress, StackTraceFunction, StackTraceInlineMarker,
+        StackTraceSourceLocation, probe_rs_color_enabled,
     },
 };
+use probe_rs_rpc::CancelTopic;
+use probe_rs_rpc::core_ops::{WireBreakpointCause, WireHaltReason};
+use probe_rs_rpc::flash::{BootInfo, DownloadOptions, FlashLayout, ProgressEvent, VerifyResult};
+use probe_rs_rpc::format::FormatOptions;
+use probe_rs_rpc::monitor::{ChannelInfo, MonitorExitReason};
+use probe_rs_rpc::monitor::{MonitorMode, MonitorOptions, RttEvent, SemihostingEvent};
+use probe_rs_rpc::probe::{
+    AttachRequest, AttachResult, DebugProbeEntry, DebugProbeSelector, SelectProbeResult,
+};
+use probe_rs_rpc::rtt_client::ScanRegion;
+use probe_rs_rpc::rtt_config::RttChannelConfig;
+use probe_rs_rpc::semihosting_options::SemihostingOptions;
+use probe_rs_rpc::stack_trace::StackTrace;
+use probe_rs_rpc::stack_trace::StackTraceFrame;
+use probe_rs_rpc::test::{Test, TestResult};
+use probe_rs_rpc_client::{MonitorEvent, RpcClient, SessionInterface};
 
 type TargetOutputFiles = std::collections::HashMap<ChannelIdentifier, tokio::fs::File>;
 
 pub async fn attach_probe(
     client: &RpcClient,
     mut probe_options: ProbeOptions,
+    elf_meta: Option<ElfMetadata>,
     resume_target: bool,
 ) -> anyhow::Result<SessionInterface> {
+    let elf_meta = elf_meta.unwrap_or_default();
+
+    if let Some(elf_chip) = &elf_meta.chip
+        && let Some(probe_chip) = &probe_options.chip
+        && elf_chip.to_lowercase() != probe_chip.to_lowercase()
+    {
+        anyhow::bail!("elf_chip does not match probe_chip");
+    }
+
     // Load the chip description if provided.
     if let Some(chip_description) = probe_options.chip_description_path.take() {
         let file = tokio::fs::read_to_string(&chip_description)
@@ -70,39 +81,122 @@ pub async fn attach_probe(
                 )
             })?;
 
-        // Load the YAML locally to validate it before sending it to the remote.
-        // We may also need it locally.
-        client.registry().await.add_target_family_from_yaml(&file)?;
-
         client.load_chip_family(file).await?;
     }
 
-    let probe = select_probe(client, probe_options.probe.map(Into::into)).await?;
+    let probe = match select_probe(
+        client,
+        probe_options.probe.map(to_wire_debug_probe_selector),
+        probe_options.non_interactive,
+    )
+    .await
+    {
+        Ok(probe) => probe,
+        Err(error) => {
+            print_setup_hints_if_relevant(client).await;
+            return Err(error);
+        }
+    };
 
-    let result = client
-        .attach_probe(AttachRequest {
-            chip: probe_options.chip,
-            protocol: probe_options.protocol.map(Into::into),
-            probe,
-            speed: probe_options.speed,
-            connect_under_reset: probe_options.connect_under_reset,
-            dry_run: probe_options.dry_run,
-            allow_erase_all: probe_options.allow_erase_all,
-            resume_target,
-        })
+    if probe_options.cycle_power {
+        power_reset(
+            from_wire_debug_probe_selector(probe.selector()),
+            Duration::from_secs(1),
+        )
         .await?;
+    }
+
+    let result = with_slow_attach_feedback(client.attach_probe(AttachRequest {
+        chip: probe_options.chip.or(elf_meta.chip),
+        protocol: probe_options.protocol.map(to_wire_protocol),
+        probe,
+        speed: probe_options.speed,
+        connect_under_reset: probe_options.connect_under_reset,
+        dry_run: probe_options.dry_run,
+        allow_erase_all: probe_options.allow_erase_all,
+        resume_target,
+        wait_for_probe: probe_options.attach_timeout,
+    }))
+    .await?;
 
     match result {
-        AttachResult::Success(sessid) => Ok(SessionInterface::new(client.clone(), sessid)),
-        AttachResult::ProbeNotFound => anyhow::bail!("Probe not found"),
-        AttachResult::FailedToOpenProbe(error) => anyhow::bail!("Failed to open probe: {error}"),
-        AttachResult::ProbeInUse => anyhow::bail!("Probe is already in use"),
+        AttachResult::Success(session) => Ok(SessionInterface::new(client.clone(), session)),
+        AttachResult::ProbeNotFound => {
+            print_setup_hints_if_relevant(client).await;
+            Err(ProbeNotFound.into())
+        }
+        AttachResult::FailedToOpenProbe(error) => {
+            print_setup_hints_if_relevant(client).await;
+            Err(FailedToOpenProbe(error).into())
+        }
+        // A busy probe is accessible, so no setup hint here.
+        AttachResult::ProbeInUse => Err(ProbeInUse.into()),
+        AttachResult::TargetAttachFailed {
+            message,
+            connect_under_reset,
+        } => Err(TargetAttachFailed {
+            message,
+            connect_under_reset,
+        }
+        .into()),
+    }
+}
+
+/// How long an attach may run before the user gets a progress indicator.
+const ATTACH_FEEDBACK_DELAY: Duration = Duration::from_millis(1500);
+
+/// Displays a spinner while `attach` runs, but only if `attach` is slow.
+///
+/// An attach that waits for a busy probe can take as long as the configured
+/// attach timeout, so without this the CLI looks frozen.
+async fn with_slow_attach_feedback<F: Future>(attach: F) -> F::Output {
+    let mut attach = std::pin::pin!(attach);
+
+    tokio::select! {
+        result = &mut attach => return result,
+        _ = tokio::time::sleep(ATTACH_FEEDBACK_DELAY) => {}
+    }
+
+    let multi_progress = indicatif::MultiProgress::new();
+    logging::set_progress_bar(multi_progress.clone());
+
+    let spinner = multi_progress.add(indicatif::ProgressBar::new_spinner());
+    spinner.set_style(
+        indicatif::ProgressStyle::with_template("{msg:.green.bold} {spinner} {elapsed}")
+            .expect("Error in progress bar creation. This is a bug, please report it.")
+            .tick_chars("⠁⠁⠉⠙⠚⠒⠂⠂⠒⠲⠴⠤⠄⠄⠤⠠⠠⠤⠦⠖⠒⠐⠐⠒⠓⠋⠉⠈⠈✔"),
+    );
+    spinner.set_message(format!("{:>13}", "Attaching"));
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let result = attach.await;
+
+    spinner.finish_and_clear();
+    logging::clear_progress_bar();
+
+    result
+}
+
+/// Nudge the user about probe setup after a failed attach over the RPC client.
+///
+/// Mirrors the direct-attach path: we key off the accessibility reported by
+/// listing, not the specific error, so a probe that is present but blocked (or a
+/// missing probe) prints the hint, while a busy-but-accessible probe does not.
+async fn print_setup_hints_if_relevant(client: &RpcClient) {
+    let relevant = match client.list_probes().await {
+        Ok(probes) => probes.is_empty() || probes.iter().any(|probe| probe.inaccessible),
+        // If we can't even list, something setup-related is plausible.
+        Err(_) => true,
+    };
+    if relevant {
+        crate::util::setup_hints::print_setup_hints();
     }
 }
 
 pub async fn select_probe(
     client: &RpcClient,
     probe: Option<DebugProbeSelector>,
+    non_interactive: bool,
 ) -> anyhow::Result<DebugProbeEntry> {
     use anyhow::Context as _;
     use std::io::Write as _;
@@ -110,13 +204,20 @@ pub async fn select_probe(
     match client.select_probe(probe).await? {
         SelectProbeResult::Success(probe) => Ok(probe),
         SelectProbeResult::MultipleProbes(list) => {
-            println!("Available Probes:");
-            for (i, probe_info) in list.iter().enumerate() {
-                println!("{i}: {probe_info}");
+            if non_interactive {
+                return Err(MultipleProbesFound {
+                    list: list.iter().map(|probe| probe.to_string()).collect(),
+                }
+                .into());
             }
 
-            print!("Selection: ");
-            std::io::stdout().flush().unwrap();
+            eprintln!("Available Probes:");
+            for (i, probe_info) in list.iter().enumerate() {
+                eprintln!("{i}: {probe_info}");
+            }
+
+            eprint!("Selection: ");
+            std::io::stderr().flush().unwrap();
 
             let mut input = String::new();
             std::io::stdin()
@@ -140,6 +241,50 @@ pub async fn select_probe(
             }
         }
     }
+}
+
+/// More than one probe matched, and interactive selection was disabled.
+#[derive(Debug)]
+pub struct MultipleProbesFound {
+    pub list: Vec<String>,
+}
+
+impl std::fmt::Display for MultipleProbesFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "The following devices were found:")?;
+        for (num, probe) in self.list.iter().enumerate() {
+            writeln!(f, "[{num}]: {probe}")?;
+        }
+        write!(
+            f,
+            "\nUse '--probe VID:PID' or '--probe VID:PID:Serial' to select one."
+        )
+    }
+}
+
+impl std::error::Error for MultipleProbesFound {}
+
+/// No probe matched the selector / listing.
+#[derive(Debug, thiserror::Error)]
+#[error("Probe not found")]
+pub struct ProbeNotFound;
+
+/// The selected probe is held by another session.
+#[derive(Debug, thiserror::Error)]
+#[error("Probe is already in use")]
+pub struct ProbeInUse;
+
+/// Opening the probe failed before a chip attach was attempted.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to open probe: {0}")]
+pub struct FailedToOpenProbe(pub String);
+
+/// The probe opened, but connecting to the chip failed.
+#[derive(Debug, thiserror::Error)]
+#[error("Connecting to the chip was unsuccessful: {message}")]
+pub struct TargetAttachFailed {
+    pub message: String,
+    pub connect_under_reset: bool,
 }
 
 /// A selector for a named stream, be it an RTT or a semihosting channel.
@@ -228,21 +373,13 @@ pub(crate) async fn connect_target_output_files(
     let mut map = TargetOutputFiles::new();
     for component in arg {
         let parts: Vec<&str> = component.splitn(2, "=").collect();
-        let key;
-        let value;
-        match parts[..] {
+        let (key, value) = match parts[..] {
             // Tolerating empty entries in particular makes a trailing comma tolerated.
             [] => continue,
-            [single] => {
-                key = ChannelIdentifier::CatchAll;
-                value = single;
-            }
-            [first, second] => {
-                key = first.parse()?;
-                value = second;
-            }
+            [single] => (ChannelIdentifier::CatchAll, single),
+            [first, second] => (first.parse()?, second),
             _ => unreachable!("splitn produces at most 2 items."),
-        }
+        };
         let value = tokio::fs::OpenOptions::new()
             .read(false)
             .append(true)
@@ -283,26 +420,26 @@ pub(crate) fn parse_semihosting_options(arg: &[String]) -> anyhow::Result<Semiho
     Ok(options)
 }
 
-pub async fn rtt_client(
-    session: &SessionInterface,
-    path: Option<&Path>,
-    monitor_options: &MonitoringOptions,
-    timestamp_offset: Option<UtcOffset>,
-) -> anyhow::Result<CliRttClient> {
-    let elf = if let Some(path) = path {
-        tokio::fs::read(path)
-            .await
-            .with_context(|| format!("Failed to read firmware from {}", path.display()))?
-    } else {
-        vec![]
-    };
+#[derive(Default)]
+pub struct FileMetadata {
+    pub defmt_data: Option<DefmtState>,
+    pub scan_regions: Option<ScanRegion>,
+}
 
-    let mut scan_regions = monitor_options.scan_region.clone();
+pub async fn parse_metadata(path: &Path) -> anyhow::Result<(FileMetadata, Option<ElfMetadata>)> {
+    let elf = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("Failed to read firmware from {}", path.display()))?;
+
+    let mut elf_meta = None;
+    let mut scan_regions = None;
     let mut load_defmt_data = false;
-    if let Ok(opt_address) = find_rtt_control_block_in_raw_file(&elf) {
-        match opt_address {
+
+    if let Ok((rtt_block, meta)) = find_rtt_control_block_and_metadata_in_raw_file(&elf) {
+        elf_meta = Some(meta);
+        match rtt_block {
             Some(addr) => {
-                scan_regions = ScanRegion::Exact(addr);
+                scan_regions = Some(ScanRegion::Exact(addr));
                 load_defmt_data = true;
             }
             None => load_defmt_data = !elf.is_empty(),
@@ -313,6 +450,26 @@ pub async fn rtt_client(
         DefmtState::try_from_bytes(&elf)?
     } else {
         None
+    };
+
+    Ok((
+        FileMetadata {
+            defmt_data,
+            scan_regions,
+        },
+        elf_meta,
+    ))
+}
+
+pub async fn rtt_client(
+    session: &SessionInterface,
+    meta: &FileMetadata,
+    monitor_options: &MonitoringOptions,
+    timestamp_offset: Option<UtcOffset>,
+) -> anyhow::Result<CliRttClient> {
+    let scan_regions = match &meta.scan_regions {
+        Some(scan_regions) => scan_regions.clone(),
+        None => monitor_options.scan_region.clone(),
     };
 
     // We don't really know what to configure here, so we set a default configuration if we can, but that's it.
@@ -334,7 +491,7 @@ pub async fn rtt_client(
         show_timestamps: !monitor_options.no_timestamps,
         show_location: !monitor_options.no_location,
         channel_processors: vec![],
-        defmt_data,
+        defmt_data: meta.defmt_data.clone(),
         log_format: monitor_options.log_format.clone(),
     })
 }
@@ -344,7 +501,7 @@ pub async fn flash(
     path: &Path,
     format: FormatOptions,
     download_options: BinaryDownloadOptions,
-    rtt_client: Option<&mut CliRttClient>,
+    rtt_client: Option<Key<RttClient>>,
     image_target: Option<String>,
 ) -> anyhow::Result<BootInfo> {
     // Start timer.
@@ -357,6 +514,7 @@ pub async fn flash(
         verify: download_options.verify,
         disable_double_buffering: download_options.disable_double_buffering,
         preferred_algos: download_options.prefer_flash_algorithm,
+        ram_chunk_size: download_options.ram_chunk_size,
     };
 
     options.sanitize();
@@ -367,6 +525,7 @@ pub async fn flash(
             format,
             image_target,
             download_options.read_flasher_rtt,
+            rtt_client,
         )
         .await?;
 
@@ -404,22 +563,17 @@ pub async fn flash(
             Some(CliProgressBars::new())
         };
         session
-            .flash(
-                options,
-                loader.loader,
-                rtt_client.as_ref().map(|c| c.handle),
-                async |event| {
-                    if let ProgressEvent::FlashLayoutReady {
-                        flash_layout: layout,
-                    } = &event
-                    {
-                        flash_layout = Some(layout.clone());
-                    }
-                    if let Some(ref pb) = pb {
-                        pb.handle(event);
-                    }
-                },
-            )
+            .flash(options, loader.loader, async |event| {
+                if let ProgressEvent::FlashLayoutReady {
+                    flash_layout: layout,
+                } = &event
+                {
+                    flash_layout = Some(layout.clone());
+                }
+                if let Some(ref pb) = pb {
+                    pb.handle(event);
+                }
+            })
             .await?;
     }
 
@@ -432,7 +586,7 @@ pub async fn flash(
             flash_layout.merge_from(phase_layout);
         }
 
-        let visualizer = flash_layout.visualize();
+        let visualizer = crate::util::visualizer::visualize_flash_layout(&flash_layout);
         _ = visualizer.write_svg(visualizer_output);
     }
 
@@ -443,45 +597,6 @@ pub async fn flash(
     ));
 
     Ok(loader.boot_info)
-}
-
-pub enum MonitorEvent {
-    Rtt(RttEvent),
-    Semihosting(SemihostingEvent),
-}
-
-impl MultiTopic for MonitorEvent {
-    type Message = Self;
-    type Subscription = MonitorSubscription;
-
-    async fn subscribe<E>(
-        client: &HostClient<E>,
-        depth: usize,
-    ) -> Result<Self::Subscription, MultiSubscribeError>
-    where
-        E: DeserializeOwned + Schema,
-    {
-        // TODO: remove MonitorEvent from the RPC interface, split this subscribe into two:
-        // one for RTT, one for semihosting, then introduce a MultiSubscription impl for them
-        let rtt = RttTopic::subscribe(client, depth).await?;
-        let semihosting = SemihostingTopic::subscribe(client, depth).await?;
-        Ok(MonitorSubscription { rtt, semihosting })
-    }
-}
-
-pub struct MonitorSubscription {
-    rtt: <RttTopic as MultiTopic>::Subscription,
-    semihosting: <SemihostingTopic as MultiTopic>::Subscription,
-}
-impl MultiSubscription for MonitorSubscription {
-    type Message = MonitorEvent;
-
-    async fn next(&mut self) -> Option<Self::Message> {
-        tokio::select! {
-            message = self.rtt.recv() => message.map(MonitorEvent::Rtt),
-            message = self.semihosting.recv() => message.map(MonitorEvent::Semihosting),
-        }
-    }
 }
 
 // Monitor starts in read-only mode: it outputs logs, but has no prompt to type into.
@@ -560,16 +675,17 @@ pub async fn monitor(
     path: Option<&Path>,
     monitor_options: &MonitoringOptions,
     mut rtt_client: Option<CliRttClient>,
-    catch_reset: bool,
-    catch_hardfault: bool,
+    vector_catch: VectorCatchConfig,
 ) -> anyhow::Result<()> {
     let semihosting_options = parse_semihosting_options(&monitor_options.semihosting_file)?;
     let mut target_output_files =
         connect_target_output_files(&monitor_options.target_output_file).await?;
 
     let options = MonitorOptions {
-        catch_reset,
-        catch_hardfault,
+        catch_reset: vector_catch.catch_reset,
+        catch_hardfault: vector_catch.catch_hardfault,
+        catch_svc: vector_catch.catch_svc,
+        catch_hlt: vector_catch.catch_hlt,
         rtt_client: rtt_client.as_ref().map(|client| client.handle()),
         semihosting_options,
     };
@@ -584,7 +700,6 @@ pub async fn monitor(
             down_channels,
             up_channels,
         }) = &msg
-            && !down_channels.is_empty()
         {
             ui_context
                 .update(|state| {
@@ -628,9 +743,9 @@ pub async fn monitor(
         let mut selected_channel = data.selected_down_channel % channel_count;
 
         let prompt = |channel_idx| {
-            Prompt(format!(
+            Prompt::new(format!(
                 "{}> ",
-                &data.down_channels[channel_idx as usize].name
+                data.down_channels[channel_idx as usize].name
             ))
             .to_string()
         };
@@ -643,6 +758,8 @@ pub async fn monitor(
             return;
         };
 
+        let _prompt_logs = logging::install_prompt_writer(sw.clone());
+
         context
             .update(|data| data.shared_writer = Some(sw.clone()))
             .await;
@@ -650,11 +767,12 @@ pub async fn monitor(
         rl.should_print_line_on(true, false);
         loop {
             match rl.readline().await {
-                Ok(ReadlineEvent::Line(line)) => {
+                Ok(ReadlineEvent::Line(mut line)) => {
                     rl.add_history_entry(line.clone());
+                    line.push('\n');
                     if let Some(client) = data.rtt_client
                         && let Err(error) = session
-                            .send_to_rtt(client, selected_channel, line.into_bytes())
+                            .send_to_rtt(client, selected_channel, line.into_bytes(), 0)
                             .await
                     {
                         eprintln!("Error sending data to RTT: {:?}", error);
@@ -690,6 +808,9 @@ pub async fn monitor(
     // Main UI loop. Detects changes generated either by the user or received from
     // the server, and decides what to display based on the current state.
     let ui = async {
+        const LIST_RTT_TIMEOUT: Duration = Duration::from_secs(5);
+        let list_rtt_deadline = Instant::now() + LIST_RTT_TIMEOUT;
+
         loop {
             enum DisplayMode {
                 OutputOnly,
@@ -703,10 +824,10 @@ pub async fn monitor(
 
                 if locked.exited {
                     DisplayMode::Exited
-                } else if locked.down_channels.is_empty() {
-                    DisplayMode::OutputOnly
                 } else if monitor_options.list_rtt {
                     DisplayMode::ListChannelsAndQuit
+                } else if locked.down_channels.is_empty() {
+                    DisplayMode::OutputOnly
                 } else {
                     DisplayMode::CliWithPrompt
                 }
@@ -723,16 +844,39 @@ pub async fn monitor(
                 }
                 DisplayMode::CliWithPrompt => cli_with_prompt(session, &ui_context).await,
                 DisplayMode::ListChannelsAndQuit => {
+                    // Subscribe before the state check so that a discovery
+                    // notification is not lost between the check and the wait.
+                    let notified = ui_context.subscribe();
                     let mut data = ui_context.lock().await;
-                    println!("Up channels:");
-                    for (i, channel) in data.up_channels.iter().enumerate() {
-                        println!("  {}: {}", i, ChannelInfoPrinter(channel));
+                    if data.rtt_client.is_some() {
+                        fn print_channels(channels: &[ChannelInfo]) {
+                            if channels.is_empty() {
+                                println!("  None.");
+                                return;
+                            }
+                            for (i, channel) in channels.iter().enumerate() {
+                                println!("  {}: {}", i, ChannelInfoPrinter(channel));
+                            }
+                        }
+                        println!("Up channels:");
+                        print_channels(&data.up_channels);
+                        println!("Down channels:");
+                        print_channels(&data.down_channels);
+                        data.exit();
+                    } else {
+                        drop(data);
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {
+                                eprintln!("Received Ctrl+C, exiting");
+                                ui_context.exit().await;
+                            }
+                            _ = tokio::time::sleep(list_rtt_deadline.saturating_duration_since(Instant::now())) => {
+                                eprintln!("Failed to attach to RTT: Timeout");
+                                ui_context.exit().await;
+                            }
+                            _ = notified => {}
+                        }
                     }
-                    println!("Down channels:");
-                    for (i, channel) in data.down_channels.iter().enumerate() {
-                        println!("  {}: {}", i, ChannelInfoPrinter(channel));
-                    }
-                    data.exit();
                 }
                 DisplayMode::Exited => break,
             }
@@ -753,7 +897,7 @@ pub async fn monitor(
     };
 
     let (print_stack_trace, result) = match result {
-        Ok(MonitorExitReason::Success | MonitorExitReason::SemihostingExit(Ok(_))) => {
+        Ok(MonitorExitReason::SemihostingExit(Ok(_))) => {
             println!("Firmware exited successfully");
             // On success, we only print if the user asked for it.
             (monitor_options.always_print_stacktrace, Ok(()))
@@ -763,9 +907,10 @@ pub async fn monitor(
             // On ctrl-c, we only print if the user asked for it.
             (monitor_options.always_print_stacktrace, Ok(()))
         }
-        Ok(MonitorExitReason::UnexpectedExit(reason)) => {
+        Ok(MonitorExitReason::Halted(halt_reason)) => {
+            let reason = describe_halt_reason(halt_reason);
             println!("Firmware exited unexpectedly: {reason}");
-            (true, Err(anyhow::anyhow!("{reason}")))
+            (true, Err(anyhow::anyhow!(reason)))
         }
         Ok(MonitorExitReason::SemihostingExit(Err(details))) => {
             let reason = match details.reason {
@@ -807,7 +952,7 @@ pub async fn monitor(
         }
         Err(e) => {
             // Some irrecoverable error happened, probably can't print the stack trace.
-            (false, Err(e))
+            (false, Err(e.into()))
         }
     };
 
@@ -820,6 +965,32 @@ pub async fn monitor(
     }
 
     result
+}
+
+/// Describes why the core halted, for a user who runs firmware and does not
+/// debug it.
+fn describe_halt_reason(reason: WireHaltReason) -> &'static str {
+    match reason {
+        WireHaltReason::Multiple => "the core halted for multiple reasons",
+        WireHaltReason::Breakpoint(WireBreakpointCause::Hardware) => {
+            "the core halted on a hardware breakpoint"
+        }
+        WireHaltReason::Breakpoint(WireBreakpointCause::Software) => {
+            "the core halted on a software breakpoint"
+        }
+        WireHaltReason::Breakpoint(WireBreakpointCause::Unknown) => {
+            "the core halted on a breakpoint"
+        }
+        WireHaltReason::Breakpoint(WireBreakpointCause::Semihosting(_)) => {
+            "the core halted on an unsupported semihosting command"
+        }
+        WireHaltReason::Exception => "the core halted on an exception",
+        WireHaltReason::Watchpoint => "the core halted on a watchpoint",
+        WireHaltReason::Step => "the core halted after a single step",
+        WireHaltReason::Request => "the core halted on a debugger request",
+        WireHaltReason::External => "the core halted on an external request",
+        WireHaltReason::Unknown => "the core halted for an unknown reason",
+    }
 }
 
 pub async fn test(
@@ -989,8 +1160,8 @@ async fn display_stack_trace(
 
     for StackTrace { core, frames } in stack_trace.cores.iter() {
         println!("Core {core}");
-        for frame in frames {
-            println!("    {frame}");
+        for (i, frame) in frames.iter().enumerate() {
+            println!("    Frame {i}: {}", format_stack_frame(frame));
         }
         if frames.len() >= stack_frame_limit as usize {
             println!("Use `--stack-frame-limit` to increase the number of frames displayed.");
@@ -998,6 +1169,39 @@ async fn display_stack_trace(
     }
 
     Ok(())
+}
+
+/// Formats a single stack frame for display.
+pub(crate) fn format_stack_frame(frame: &StackTraceFrame) -> String {
+    use std::fmt::Write as _;
+
+    let color = probe_rs_color_enabled();
+
+    let mut s = String::new();
+    write!(
+        &mut s,
+        "{} @ {}",
+        StackTraceFunction::new(frame.function_name.as_str()).colorize(color),
+        StackTraceAddress::new(format!("{:#x}", frame.program_counter)).colorize(color),
+    )
+    .unwrap();
+    if frame.is_inlined {
+        write!(
+            &mut s,
+            " {}",
+            StackTraceInlineMarker::new("inline").colorize(color)
+        )
+        .unwrap();
+    }
+    if let Some(loc) = &frame.location {
+        write!(
+            &mut s,
+            "\n        {}",
+            StackTraceSourceLocation::new(format!("{loc}")).colorize(color)
+        )
+        .unwrap();
+    }
+    s
 }
 
 /// Runs a future until completion, running another future when Ctrl+C is received.
@@ -1185,50 +1389,14 @@ impl Channel {
         shared_writer: &impl AsyncFn(&str),
         copy_to: Option<&mut tokio::fs::File>,
     ) {
-        let mut printer = Printer {
-            prefix: &self.printer_prefix,
-            copy_to,
-            shared_writer,
-        };
-        let _ = self.decoder.process(bytes, &mut printer).await;
-    }
-}
-
-struct Printer<'a, P: AsyncFn(&str)> {
-    prefix: &'a str,
-    copy_to: Option<&'a mut tokio::fs::File>,
-    shared_writer: &'a P,
-}
-impl<P: AsyncFn(&str)> RttDataHandler for Printer<'_, P> {
-    async fn on_string_data(&mut self, data: String) -> Result<(), rtt::Error> {
-        let message = format!("{}{}", self.prefix, data);
-        (self.shared_writer)(&message).await;
-        if let Some(copy_to) = &mut self.copy_to {
-            // Silently discarding output file errors
-            _ = copy_to.write_all(data.as_bytes()).await;
-        }
-        Ok(())
-    }
-}
-
-macro_rules! styled {
-    ($name:ident($var:ident) => $style:expr) => {
-        pub struct $name<S: AsRef<str>>(pub S);
-
-        impl<S: AsRef<str>> Display for $name<S> {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                if matches!(
-                    std::env::var("PROBE_RS_COLOR").as_deref(),
-                    Err(VarError::NotPresent) | Ok("true" | "1" | "yes" | "on")
-                ) {
-                    let $var = self.0.as_ref();
-                    write!(f, "{}", $style)
-                } else {
-                    f.write_str(self.0.as_ref())
-                }
+        if let Some(data) = self.decoder.process(bytes).ok().flatten() {
+            let data = data.to_string();
+            let message = format!("{}{}", self.printer_prefix, data);
+            shared_writer(&message).await;
+            if let Some(copy_to) = copy_to {
+                // Silently discarding output file errors
+                _ = copy_to.write_all(data.as_bytes()).await;
             }
         }
-    };
+    }
 }
-
-styled!(Prompt(prompt) => prompt.bold().dark_green());

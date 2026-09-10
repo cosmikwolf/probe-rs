@@ -5,6 +5,7 @@ use nusb::{DeviceInfo, Interface, MaybeFuture};
 
 use crate::probe::{
     self, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeCreationError,
+    list::{ProbeListItem, usb_probe_accessibility},
     usb_util::InterfaceExt,
 };
 
@@ -130,7 +131,7 @@ impl Ch347UsbJtagDevice {
         // set 15MHz speed, and check pack mode
         let mut obuf = [0xD0, 0x06, 0x00, 0x00, 0x07, 0x30, 0x30, 0x30, 0x30];
         let mut ibuf = [0; 4];
-        let pack;
+
         interface
             .write_bulk(0x06, &obuf, Duration::from_millis(500))
             .map_err(ProbeCreationError::Usb)?;
@@ -140,14 +141,14 @@ impl Ch347UsbJtagDevice {
             .map_err(ProbeCreationError::Usb)?;
 
         // check the pack mode
-        if ibuf[0] == 0xD0 && ibuf[3] == 0x00 {
+        let pack = if ibuf[0] == 0xD0 && ibuf[3] == 0x00 {
             // LARGER_Pack Mode
             obuf[4] = 5;
-            pack = Pack::LargePack;
+            Pack::LargePack
         } else {
             obuf[4] = 3;
-            pack = Pack::StandardPack;
-        }
+            Pack::StandardPack
+        };
 
         // set default 15MHz
         interface
@@ -286,12 +287,12 @@ impl Ch347UsbJtagDevice {
     }
 }
 
-pub(super) fn list_ch347usbjtag_devices() -> Vec<DebugProbeInfo> {
+pub(super) fn list_ch347usbjtag_devices() -> Vec<ProbeListItem> {
     match nusb::list_devices().wait() {
         Ok(devices) => devices
             .filter(is_ch34x_device)
             .map(|device| {
-                DebugProbeInfo::new(
+                let info = DebugProbeInfo::new(
                     "CH347 USB Jtag".to_string(),
                     device.vendor_id(),
                     device.product_id(),
@@ -299,7 +300,11 @@ pub(super) fn list_ch347usbjtag_devices() -> Vec<DebugProbeInfo> {
                     &Ch347UsbJtagFactory,
                     None,
                     false,
-                )
+                );
+                ProbeListItem {
+                    info,
+                    accessibility: usb_probe_accessibility(&device),
+                }
             })
             .collect(),
         Err(e) => {

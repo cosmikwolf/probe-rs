@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0 # This is a workaround for cargo-release, see https://github.com/crate-ci/cargo-release/issues/625
           # We need to manually set a token here to ensure that we can trigger the `cargo dist` workflow.
@@ -94,3 +94,12 @@ jobs:
           echo "::endgroup::"
         env:
           SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+
+      # dist releases run on workflow_dispatch (dispatch-releases), so kick off
+      # the build for the tag we just pushed.
+      - name: Trigger the release build
+        run: gh workflow run v-release.yml --ref "$RELEASE_BRANCH" -f tag="v$VERSION"
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RELEASE_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.ref || github.ref_name }}
+          VERSION: ${{ steps.crate_version.outputs.version }}

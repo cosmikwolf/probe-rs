@@ -5,16 +5,15 @@ use protocol::Ch347UsbJtagDevice;
 
 use crate::{
     architecture::{
-        arm::{ArmCommunicationInterface, communication_interface::DapProbe},
-        riscv::dtm::jtag_dtm::JtagDtmBuilder,
+        arm::ArmCommunicationInterface, riscv::dtm::jtag_dtm::JtagDtmBuilder,
         xtensa::communication_interface::XtensaCommunicationInterface,
     },
-    probe::{DebugProbe, ProbeFactory},
+    probe::{BitbangSwd, DebugProbe, ProbeFactory},
 };
 
 use super::{
-    AutoImplementJtagAccess, DebugProbeError, IoSequenceItem, JtagDriverState, RawJtagIo, RawSwdIo,
-    SwdSettings,
+    BitbangJtag, DebugProbeError, IoSequenceItem, JtagChain, JtagChainAccess, JtagChainState,
+    SwdProbe, SwdSettings, TapState,
 };
 
 /// A factory for creating [`Ch347UsbJtag`] instances.
@@ -31,7 +30,7 @@ impl std::fmt::Display for Ch347UsbJtagFactory {
 #[derive(Debug)]
 pub struct Ch347UsbJtag {
     device: Ch347UsbJtagDevice,
-    jtag_state: JtagDriverState,
+    jtag_state: JtagChainState,
     swd_settings: SwdSettings,
 }
 
@@ -45,43 +44,47 @@ impl ProbeFactory for Ch347UsbJtagFactory {
         tracing::info!("Found ch347 device");
         Ok(Box::new(Ch347UsbJtag {
             device: ch347,
-            jtag_state: JtagDriverState::default(),
+            jtag_state: JtagChainState::default(),
             swd_settings: SwdSettings::default(),
         }))
     }
 
-    fn list_probes(&self) -> Vec<super::DebugProbeInfo> {
+    fn list_probes(&self) -> Vec<super::list::ProbeListItem> {
         protocol::list_ch347usbjtag_devices()
     }
 }
 
-impl RawJtagIo for Ch347UsbJtag {
-    fn shift_bit(
-        &mut self,
-        tms: bool,
-        tdi: bool,
-        capture: bool,
-    ) -> Result<(), super::DebugProbeError> {
-        self.jtag_state.state.update(tms);
+impl BitbangJtag for Ch347UsbJtag {
+    fn tap_state(&mut self) -> &mut TapState {
+        &mut self.jtag_state.tap_state
+    }
+
+    fn shift(&mut self, tms: bool, tdi: bool, capture: bool) -> Result<(), super::DebugProbeError> {
         self.device.shift_bit(tms, tdi, capture)?;
 
         Ok(())
     }
 
-    fn read_captured_bits(&mut self) -> Result<bitvec::prelude::BitVec, super::DebugProbeError> {
-        self.device.read_captured_bits()
+    fn flush(&mut self) -> Result<(), super::DebugProbeError> {
+        Ok(())
     }
 
-    fn state_mut(&mut self) -> &mut JtagDriverState {
+    fn captured(&mut self) -> Result<bitvec::prelude::BitVec, super::DebugProbeError> {
+        self.device.read_captured_bits()
+    }
+}
+
+impl JtagChainAccess for Ch347UsbJtag {
+    fn chain_state(&mut self) -> &mut JtagChainState {
         &mut self.jtag_state
     }
 
-    fn state(&self) -> &JtagDriverState {
+    fn chain_state_ref(&self) -> &JtagChainState {
         &self.jtag_state
     }
 }
 
-impl RawSwdIo for Ch347UsbJtag {
+impl BitbangSwd for Ch347UsbJtag {
     fn swd_io<S>(&mut self, _swdio: S) -> Result<Vec<bool>, DebugProbeError>
     where
         S: IntoIterator<Item = IoSequenceItem>,
@@ -91,24 +94,10 @@ impl RawSwdIo for Ch347UsbJtag {
         })
     }
 
-    fn swj_pins(
-        &mut self,
-        _pin_out: u32,
-        _pin_select: u32,
-        _pin_wait: u32,
-    ) -> Result<u32, DebugProbeError> {
-        Err(DebugProbeError::CommandNotSupportedByProbe {
-            command_name: "swj_pins",
-        })
-    }
-
     fn swd_settings(&self) -> &SwdSettings {
         &self.swd_settings
     }
 }
-
-impl AutoImplementJtagAccess for Ch347UsbJtag {}
-impl DapProbe for Ch347UsbJtag {}
 
 impl DebugProbe for Ch347UsbJtag {
     fn get_name(&self) -> &str {
@@ -173,7 +162,15 @@ impl DebugProbe for Ch347UsbJtag {
         self
     }
 
-    fn try_as_jtag_probe(&mut self) -> Option<&mut dyn super::JtagAccess> {
+    fn try_as_jtag_chain(&mut self) -> Option<JtagChain<'_>> {
+        Some(JtagChain::new(self))
+    }
+
+    fn try_as_swd_probe_mut(&mut self) -> Option<&mut dyn SwdProbe> {
+        Some(self)
+    }
+
+    fn try_as_jtag_chain_access_mut(&mut self) -> Option<&mut dyn JtagChainAccess> {
         Some(self)
     }
 
@@ -188,7 +185,10 @@ impl DebugProbe for Ch347UsbJtag {
         Box<dyn crate::architecture::arm::ArmDebugInterface + 'probe>,
         (Box<dyn DebugProbe>, crate::architecture::arm::ArmError),
     > {
-        Ok(ArmCommunicationInterface::create(self, sequence, true))
+        let settings = SwdProbe::swd_settings(self.as_ref());
+        Ok(ArmCommunicationInterface::create_jtag(
+            self, settings, sequence, true,
+        ))
     }
 
     fn has_riscv_interface(&self) -> bool {

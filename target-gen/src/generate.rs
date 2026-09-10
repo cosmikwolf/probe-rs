@@ -176,6 +176,7 @@ where
             rtt_scan_ranges: None,
             jtag: None, // TODO, parse scan chain from sdf
             default_binary_format: None,
+            skip_reset_on_ram_boot: false,
         });
     }
 
@@ -216,6 +217,7 @@ fn create_core(processor: &Processor) -> Result<ProbeCore> {
             Architecture::Riscv => CoreAccessOptions::Riscv(RiscvCoreAccessOptions {
                 hart_id: None,
                 jtag_tap: None,
+                mem_ap: None,
             }),
             Architecture::Xtensa => {
                 CoreAccessOptions::Xtensa(XtensaCoreAccessOptions { jtag_tap: None })

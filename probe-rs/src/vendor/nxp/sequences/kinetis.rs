@@ -343,11 +343,7 @@ fn kinetis_mass_erase(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError>
 
     // --- Step 4: Write FMEIP (with SYS_RES_REQ, matching OpenOCD) ---
     tracing::debug!("Kinetis mass erase: writing SYS_RES_REQ | FMEIP");
-    iface.write_raw_ap_register(
-        mdm_ap,
-        MDM_CONTROL,
-        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP,
-    )?;
+    iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP)?;
 
     let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
     if (control & MDM_CTRL_FMEIP) == 0 {
@@ -359,9 +355,7 @@ fn kinetis_mass_erase(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError>
         iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_FMEIP)?;
         let control = iface.read_raw_ap_register(mdm_ap, MDM_CONTROL)?;
         if (control & MDM_CTRL_FMEIP) == 0 {
-            tracing::error!(
-                "Kinetis mass erase: FMEIP not accepted (ctrl={control:#010x})"
-            );
+            tracing::error!("Kinetis mass erase: FMEIP not accepted (ctrl={control:#010x})");
             let _ = iface.swj_pins(n_reset_mask, n_reset_mask, 0);
             return Err(ArmDebugSequenceError::custom(
                 "Kinetis: FMEIP write rejected while nRST held and FREADY=1. \
@@ -421,7 +415,11 @@ fn kinetis_mass_erase(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError>
     let still_secured = (status & MDM_STAT_SYSSEC) != 0;
     tracing::info!(
         "Kinetis: post-erase MDM Status = {status:#010x}, SYSSEC={}",
-        if still_secured { "still secured" } else { "unsecured" }
+        if still_secured {
+            "still secured"
+        } else {
+            "unsecured"
+        }
     );
 
     if still_secured {
@@ -436,7 +434,11 @@ fn kinetis_mass_erase(iface: &mut dyn ArmDebugInterface) -> Result<(), ArmError>
         let status = iface.read_raw_ap_register(mdm_ap, MDM_STATUS)?;
         tracing::info!(
             "Kinetis: post-nRST-cycle MDM Status = {status:#010x}, SYSSEC={}",
-            if (status & MDM_STAT_SYSSEC) != 0 { "still secured!" } else { "unsecured" }
+            if (status & MDM_STAT_SYSSEC) != 0 {
+                "still secured!"
+            } else {
+                "unsecured"
+            }
         );
     }
 
@@ -537,11 +539,7 @@ fn kinetis_mass_erase_no_nrst(iface: &mut dyn ArmDebugInterface) -> Result<(), A
         }
     }
 
-    iface.write_raw_ap_register(
-        mdm_ap,
-        MDM_CONTROL,
-        MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP,
-    )?;
+    iface.write_raw_ap_register(mdm_ap, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ | MDM_CTRL_FMEIP)?;
 
     // Poll FMEIP=0.
     let start = Instant::now();

@@ -30,6 +30,9 @@ pub enum ChipDetectionMethod {
 
     /// Renesas RA chip detection information.
     RenesasPnr(RenesasPnrDetection),
+
+    /// WCH-Link probe-firmware-based chip detection.
+    WchLink(WchLinkDetection),
 }
 
 impl ChipDetectionMethod {
@@ -95,6 +98,15 @@ impl ChipDetectionMethod {
             None
         }
     }
+
+    /// Returns the WCH-Link detection information if available.
+    pub fn as_wch_link(&self) -> Option<&WchLinkDetection> {
+        if let Self::WchLink(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
 
 /// Microchip ATSAM chip detection information when the device contains a DSU.
@@ -124,7 +136,13 @@ pub struct EspressifDetection {
     #[serde(serialize_with = "hex_u_int")]
     pub idcode: u32,
 
+    /// Address of the magic chip value
+    #[serde(serialize_with = "hex_u_int")]
+    pub magic_address: u32,
+
     /// Magic chip value => Target name.
+    ///
+    /// Can be empty if the IDCODE is chip-unique and the family has a single variant.
     #[serde(serialize_with = "hex_keys_indexmap")]
     #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
     pub variants: IndexMap<u32, String>,
@@ -217,4 +235,44 @@ pub struct RenesasPnrDetection {
 
     /// Chip part number
     pub variants: Vec<String>,
+}
+
+/// WCH-Link probe-firmware-based chip detection information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WchLinkDetection {
+    /// Mask applied to the probe's `chip_id` before lookup.
+    #[serde(serialize_with = "hex_u_int")]
+    pub mask: u32,
+
+    /// `(chip_id & mask)` => Target name.
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub variants: IndexMap<u32, String>,
+
+    /// Optional post-attach SRAM/CODE split lookup keyed by `(chip_id & mask)`.
+    /// Resolves a WCH variant whose code/RAM partition is OB-configurable.
+    #[serde(default)]
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub ob_code_ram_splits: IndexMap<u32, ObCodeRamSplit>,
+}
+
+/// Per-`chip_id` SRAM/CODE split table — read one OB byte over the debug
+/// interface and look the masked value up to pick the right variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObCodeRamSplit {
+    /// Flash address of the OB byte to read.
+    #[serde(serialize_with = "hex_u_int")]
+    pub address: u64,
+
+    /// Bitmask applied to the read byte before lookup.
+    #[serde(serialize_with = "hex_u_int")]
+    pub mask: u8,
+
+    /// `(read_byte & mask)` => Target name.
+    #[serde(serialize_with = "hex_keys_indexmap")]
+    #[serde(deserialize_with = "maps_duplicate_key_is_error::deserialize")]
+    pub variants: IndexMap<u8, String>,
 }

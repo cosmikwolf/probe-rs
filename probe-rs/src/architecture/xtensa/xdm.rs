@@ -9,10 +9,13 @@ use bitvec::{field::BitField, slice::BitSlice};
 use crate::{
     architecture::xtensa::arch::instruction::{Instruction, InstructionEncoding},
     probe::{
-        CommandResult, JtagAccess, JtagWriteCommand, JtagWriteData, ShiftDrCommand, ShiftDrData,
-        queue::{BatchError, DeferredResultIndex, DeferredResultSet, Queue},
+        BitSequence, CommandResult, JtagBatch, JtagChain, JtagWriteCommand, JtagWriteData,
+        ShiftDrCommand, ShiftDrData,
+        queue::{BatchError, Handle, JtagQueue, Results},
     },
 };
+
+use crate::probe::DebugProbeError;
 
 use super::communication_interface::XtensaError;
 
@@ -148,10 +151,10 @@ pub(crate) struct XdmState {
 
     /// The command queue for the current batch. JTAG accesses are batched to reduce the number of
     /// IO operations.
-    queue: Queue<Error>,
+    queue: JtagQueue<Error>,
 
     /// The results of the reads in the already executed batched JTAG commands.
-    jtag_results: DeferredResultSet<CommandResult>,
+    jtag_results: Results,
 
     /// Read handles for accesses that need to force capturing their bits.
     ///
@@ -159,7 +162,7 @@ pub(crate) struct XdmState {
     /// the number of JTAG operations. However, some accesses need to capture their bits to
     /// complete correctly, or to - ironically - increase performance. We store their otherwise
     /// ignored handles in this vector and drop them when we're done with the batch.
-    status_idxs: Vec<DeferredResultIndex>,
+    status_idxs: Vec<Handle<CommandResult>>,
 }
 
 /// The lower level functions of the Xtensa Debug Module.
@@ -167,26 +170,55 @@ pub(crate) struct XdmState {
 // move the instruction execution into the current communication_interface module.
 #[derive(Debug)]
 pub struct Xdm<'probe> {
-    /// The JTAG interface.
-    pub probe: &'probe mut dyn JtagAccess,
+    probe: JtagChain<'probe>,
 
-    /// Debug module state.
     state: &'probe mut XdmState,
 }
 
 impl<'probe> Xdm<'probe> {
-    pub(crate) fn new(probe: &'probe mut dyn JtagAccess, state: &'probe mut XdmState) -> Self {
+    pub(crate) fn new(probe: JtagChain<'probe>, state: &'probe mut XdmState) -> Self {
         // TODO implement openocd's esp32_queue_tdi_idle() to prevent potentially damaging flash ICs
 
         Self { probe, state }
     }
 
+    fn tap_reset(&mut self) -> Result<(), XtensaError> {
+        let mut batch = JtagBatch::new();
+        self.probe.tap_reset(&mut batch);
+        self.probe.run(batch).map(|_| ()).map_err(XtensaError::from)
+    }
+
+    fn exchange_register(
+        &mut self,
+        address: u32,
+        dr: BitSequence,
+        idle_cycles: u32,
+    ) -> Result<BitSequence, XtensaError> {
+        if address > self.probe.params().max_ir_address() {
+            return Err(DebugProbeError::Other(format!(
+                "Invalid instruction register access: {address}"
+            ))
+            .into());
+        }
+
+        let ir_len = self.probe.params().irlen;
+        let mut batch = JtagBatch::new();
+        let ir = BitSequence::from_bytes(&address.to_le_bytes(), ir_len);
+        self.probe.shift_ir(&mut batch, &ir);
+        let handle = self.probe.exchange_dr(&mut batch, &dr);
+        self.probe.run_test_idle(&mut batch, idle_cycles);
+        let mut results = self.probe.run(batch)?;
+        results
+            .take(handle)
+            .map_err(|_| XtensaError::BatchedResultNotAvailable)
+    }
+
     #[tracing::instrument(skip(self))]
     pub(crate) fn enter_debug_mode(&mut self) -> Result<(), XtensaError> {
-        self.state.queue = Queue::new();
-        self.state.jtag_results = DeferredResultSet::new();
+        self.state.queue = JtagQueue::new();
+        self.state.jtag_results = Results::new();
 
-        self.probe.tap_reset()?;
+        self.tap_reset()?;
 
         // Reset PCM
         let mut pwr_control = PowerControl(0);
@@ -324,7 +356,7 @@ impl<'probe> Xdm<'probe> {
         let mut started = Instant::now();
         let mut previous_queue_len = queue.len();
         while !queue.is_empty() {
-            match queue.execute(|queue| self.probe.write_register_batch(queue)) {
+            match queue.execute(|queue| self.probe.run_command_batch(queue)) {
                 Ok(result) => {
                     self.state.jtag_results.merge_from(result);
                     return Ok(());
@@ -383,7 +415,7 @@ impl<'probe> Xdm<'probe> {
             }
 
             // If progress was made, reset the timeout.
-            if queue.len() != previous_queue_len {
+            if queue.len() < previous_queue_len {
                 started = Instant::now();
                 previous_queue_len = queue.len();
             }
@@ -398,32 +430,35 @@ impl<'probe> Xdm<'probe> {
 
     pub(crate) fn read_deferred_result(
         &mut self,
-        index: DeferredResultIndex,
+        index: Handle<CommandResult>,
     ) -> Result<CommandResult, XtensaError> {
         match self.state.jtag_results.take(index) {
             Ok(result) => Ok(result),
-            Err(index) => {
+            Err(handle) => {
                 self.execute()?;
-                // We can lose data if `execute` fails.
                 self.state
                     .jtag_results
-                    .take(index)
+                    .take(handle)
                     .map_err(|_| XtensaError::BatchedResultNotAvailable)
             }
         }
     }
 
-    fn do_nexus_op(&mut self, nar: u8, ndr: u32, transform: TransformFn) -> DeferredResultIndex {
+    fn do_nexus_op(&mut self, nar: u8, ndr: u32, transform: TransformFn) -> Handle<CommandResult> {
         let nar_idx = self.state.queue.schedule(JtagWriteCommand {
             data: JtagWriteData {
                 address: TapInstruction::Nar.code(),
-                data: nar.to_le_bytes().to_vec(),
-                len: TapInstruction::Nar.bits(),
+                data: BitSequence::from_bytes(
+                    &nar.to_le_bytes(),
+                    TapInstruction::Nar.bits() as usize,
+                ),
+                idle_cycles: 0,
             },
             transform: |write, capture| {
                 let capture = capture.load_le::<u8>();
-                let nar = write.data[0] >> 1;
-                let is_write = write.data[0] & 1 == 1;
+                let nar_byte = write.data.as_bits().load_le::<u8>();
+                let nar = nar_byte >> 1;
+                let is_write = nar_byte & 1 == 1;
 
                 Err(Error::Xdm {
                     narsel: nar,
@@ -443,8 +478,11 @@ impl<'probe> Xdm<'probe> {
 
         self.state.queue.schedule(ShiftDrCommand {
             inner: ShiftDrData {
-                data: ndr.to_le_bytes().to_vec(),
-                len: TapInstruction::Ndr.bits(),
+                data: BitSequence::from_bytes(
+                    &ndr.to_le_bytes(),
+                    TapInstruction::Ndr.bits() as usize,
+                ),
+                idle_cycles: 0,
             },
             transform,
         })
@@ -455,19 +493,19 @@ impl<'probe> Xdm<'probe> {
         &mut self,
         address: u8,
         transform: TransformFn,
-    ) -> DeferredResultIndex {
+    ) -> Handle<CommandResult> {
         let regdata = address << 1;
 
         self.do_nexus_op(regdata, 0, transform)
     }
 
     /// Perform an access to a register
-    fn schedule_dbg_read(&mut self, address: u8) -> DeferredResultIndex {
+    fn schedule_dbg_read(&mut self, address: u8) -> Handle<CommandResult> {
         self.schedule_dbg_read_and_transform(address, transform_u32)
     }
 
     /// Perform an access to a register
-    fn schedule_dbg_write(&mut self, address: u8, value: u32) -> DeferredResultIndex {
+    fn schedule_dbg_write(&mut self, address: u8, value: u32) -> Handle<CommandResult> {
         let regdata = (address << 1) | 1;
 
         self.do_nexus_op(regdata, value, transform_noop)
@@ -476,31 +514,38 @@ impl<'probe> Xdm<'probe> {
     fn pwr_write(&mut self, dev: PowerDevice, value: u8) -> Result<u8, XtensaError> {
         let instr = TapInstruction::from(dev);
 
-        let capture = self
-            .probe
-            .write_register(instr.code(), &[value], instr.bits())?;
+        let capture = self.exchange_register(
+            instr.code(),
+            BitSequence::from_bytes(&[value], instr.bits() as usize),
+            0,
+        )?;
 
-        let res = capture.load_le::<u8>();
+        let res = capture.as_bits().load_le::<u8>();
         tracing::trace!("pwr_write response: {:?}", res);
 
         Ok(res)
     }
 
     pub(super) fn read_idcode(&mut self) -> Result<u32, XtensaError> {
+        self.tap_reset()?;
         let instr = TapInstruction::Idcode;
 
-        let capture = self
-            .probe
-            .write_register(instr.code(), &[0, 0, 0, 0], instr.bits())?;
+        let capture = self.exchange_register(
+            instr.code(),
+            BitSequence::repeat(false, instr.bits() as usize),
+            0,
+        )?;
 
-        let res = capture.load_le::<u32>();
+        let res = capture.as_bits().load_le::<u32>();
 
         tracing::debug!("idcode response: {:x?}", res);
 
         Ok(res)
     }
 
-    pub(super) fn schedule_read_nexus_register<R: NexusRegister>(&mut self) -> DeferredResultIndex {
+    pub(super) fn schedule_read_nexus_register<R: NexusRegister>(
+        &mut self,
+    ) -> Handle<CommandResult> {
         tracing::debug!("Reading from {}", R::NAME);
         self.schedule_dbg_read(R::ADDRESS)
     }
@@ -647,11 +692,11 @@ impl<'probe> Xdm<'probe> {
         self.schedule_wait_for_last_instruction();
     }
 
-    pub(super) fn schedule_read_ddr(&mut self) -> DeferredResultIndex {
+    pub(super) fn schedule_read_ddr(&mut self) -> Handle<CommandResult> {
         self.schedule_read_nexus_register::<DebugDataRegister>()
     }
 
-    pub(super) fn schedule_read_ddr_and_execute(&mut self) -> DeferredResultIndex {
+    pub(super) fn schedule_read_ddr_and_execute(&mut self) -> Handle<CommandResult> {
         let reader = self.schedule_read_nexus_register::<DebugDataAndExecRegister>();
         self.schedule_wait_for_last_instruction();
 

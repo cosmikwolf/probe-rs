@@ -10,6 +10,8 @@ use std::{
 
 use probe_rs_target::CoreType;
 
+pub use crate::flashing::DebugFlashSequence;
+
 use crate::{
     MemoryInterface, MemoryMappedRegister,
     architecture::arm::{
@@ -17,14 +19,13 @@ use crate::{
         core::registers::cortex_m::{PC, SP},
         dp::{Ctrl, DLPIDR, DebugPortError, DpRegister, TARGETID},
     },
-    probe::WireProtocol,
+    probe::{BitSequence, WireProtocol, swd::Port},
 };
 
 use super::{
     ArmError, DapAccess, FullyQualifiedApAddress, Pins,
     ap::AccessPortError,
     armv6m::Demcr,
-    communication_interface::DapProbe,
     component::{TraceFunnel, TraceSink},
     core::cortex_m::{Dhcsr, Vtor},
     dp::{Abort, DPIDR, DpAccess, DpAddress, SelectV1},
@@ -32,6 +33,7 @@ use super::{
         ArmMemoryInterface,
         romtable::{CoresightComponent, PeripheralType},
     },
+    traits::DebugPortWire,
 };
 
 /// An error occurred when executing an ARM debug sequence
@@ -70,11 +72,11 @@ impl DefaultArmSequence {
 impl ArmDebugSequence for DefaultArmSequence {}
 
 /// ResetCatchSet for Cortex-A devices
-fn armv7a_reset_catch_set(
+fn armv7ar_reset_catch_set(
     core: &mut dyn ArmMemoryInterface,
     debug_base: Option<u64>,
 ) -> Result<(), ArmError> {
-    use crate::architecture::arm::core::armv7a_debug_regs::Dbgvcr;
+    use crate::architecture::arm::core::armv7ar_debug_regs::Dbgvcr;
 
     let debug_base =
         debug_base.ok_or_else(|| ArmError::from(ArmDebugSequenceError::DebugBaseNotSpecified))?;
@@ -89,11 +91,11 @@ fn armv7a_reset_catch_set(
 }
 
 /// ResetCatchClear for Cortex-A devices
-fn armv7a_reset_catch_clear(
+fn armv7ar_reset_catch_clear(
     core: &mut dyn ArmMemoryInterface,
     debug_base: Option<u64>,
 ) -> Result<(), ArmError> {
-    use crate::architecture::arm::core::armv7a_debug_regs::Dbgvcr;
+    use crate::architecture::arm::core::armv7ar_debug_regs::Dbgvcr;
 
     let debug_base =
         debug_base.ok_or_else(|| ArmError::from(ArmDebugSequenceError::DebugBaseNotSpecified))?;
@@ -107,7 +109,7 @@ fn armv7a_reset_catch_clear(
     Ok(())
 }
 
-fn armv7a_reset_system(
+fn armv7ar_reset_system(
     interface: &mut dyn ArmMemoryInterface,
     debug_base: Option<u64>,
 ) -> Result<(), ArmError> {
@@ -116,7 +118,7 @@ fn armv7a_reset_system(
     // Arm deprecate use of this bit. You may need to implement a vendor-specific
     // reset sequence instead.
     tracing::debug!("Running default ARMv7A system reset via DBGPRCR.CWRR");
-    use crate::architecture::arm::core::armv7a_debug_regs::{Dbgprcr, Dbgprsr};
+    use crate::architecture::arm::core::armv7ar_debug_regs::{Dbgprcr, Dbgprsr};
 
     let debug_base =
         debug_base.ok_or_else(|| ArmError::from(ArmDebugSequenceError::DebugBaseNotSpecified))?;
@@ -143,13 +145,11 @@ fn armv7a_reset_system(
 }
 
 /// DebugCoreStart for v7 Cortex-A devices
-fn armv7a_core_start(
+fn armv7ar_core_start(
     core: &mut dyn ArmMemoryInterface,
     debug_base: Option<u64>,
 ) -> Result<(), ArmError> {
-    use crate::architecture::arm::core::armv7a_debug_regs::{
-        Dbgdsccr, Dbgdscr, Dbgdsmcr, Dbglar, Dbgvcr,
-    };
+    use crate::architecture::arm::core::armv7ar_debug_regs::{Dbgdsccr, Dbgdscr, Dbgdsmcr, Dbglar};
 
     let debug_base =
         debug_base.ok_or_else(|| ArmError::from(ArmDebugSequenceError::DebugBaseNotSpecified))?;
@@ -170,9 +170,8 @@ fn armv7a_core_start(
     let address = Dbgdsmcr::get_mmio_address_from_base(debug_base)?;
     core.write_word_32(address, Dbgdsmcr(0).into())?;
 
-    // Clear all vector catch bits to ensure defined startup value
-    let address = Dbgvcr::get_mmio_address_from_base(debug_base)?;
-    core.write_word_32(address, Dbgvcr(0).into())?;
+    // Note: SVC/HLT vector catches are configured separately
+    // via enable_vector_catch() with VectorCatchCondition::Svc/Hlt
 
     // Enable halting
     let address = Dbgdscr::get_mmio_address_from_base(debug_base)?;
@@ -450,11 +449,11 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ///
     /// [ARM SVD Debug Description]: https://open-cmsis-pack.github.io/Open-CMSIS-Pack-Spec/main/html/debug_description.html#resetHardwareAssert
     #[doc(alias = "ResetHardwareAssert")]
-    fn reset_hardware_assert(&self, interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+    fn reset_hardware_assert(&self, interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
         let mut n_reset = Pins(0);
         n_reset.set_nreset(true);
 
-        let _ = interface.swj_pins(0, n_reset.0 as u32, 0)?;
+        let _ = interface.swj_pins(Pins(0), n_reset, Duration::ZERO)?;
 
         Ok(())
     }
@@ -514,7 +513,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     #[doc(alias = "DebugPortSetup")]
     fn debug_port_setup(
         &self,
-        interface: &mut dyn DapProbe,
+        interface: &mut dyn DebugPortWire,
         dp: DpAddress,
     ) -> Result<(), ArmError> {
         // TODO: Handle this differently for ST-Link?
@@ -526,17 +525,15 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         // the SWD version 2 sequence.
         let mut has_dormant = matches!(dp, DpAddress::Multidrop(_));
 
-        fn alert_sequence(interface: &mut dyn DapProbe) -> Result<(), ArmError> {
+        fn alert_sequence(interface: &mut dyn DebugPortWire) -> Result<(), ArmError> {
             tracing::trace!("Sending Selection Alert sequence");
 
             // Ensure target is not in the middle of detecting a selection alert
-            interface.swj_sequence(8, 0xFF)?;
+            interface.swj_sequence(&BitSequence::from_u64(8, 0xFF))?;
 
-            // Alert Sequence Bits  0.. 63
-            interface.swj_sequence(64, 0x86852D956209F392)?;
-
-            // Alert Sequence Bits 64..127
-            interface.swj_sequence(64, 0x19BC0EA2E3DDAFE9)?;
+            let mut alert = BitSequence::from_u64(64, 0x86852D956209F392);
+            alert.extend(&BitSequence::from_u64(64, 0x19BC0EA2E3DDAFE9));
+            interface.swj_sequence(&alert)?;
 
             Ok(())
         }
@@ -555,23 +552,23 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
                 Some(WireProtocol::Jtag) => {
                     if has_dormant {
                         tracing::debug!("Select Dormant State (from SWD)");
-                        interface.swj_sequence(16, 0xE3BC)?;
+                        interface.swj_sequence(&BitSequence::from_u64(16, 0xE3BC))?;
 
                         // Send alert sequence
                         alert_sequence(interface)?;
 
                         // 4 cycles SWDIO/TMS LOW + 8-Bit JTAG Activation Code (0x0A)
-                        interface.swj_sequence(12, 0x0A0)?;
+                        interface.swj_sequence(&BitSequence::from_u64(12, 0x0A0))?;
                     } else {
                         // Execute SWJ-DP Switch Sequence SWD to JTAG (0xE73C).
-                        interface.swj_sequence(16, 0xE73C)?;
+                        interface.swj_sequence(&BitSequence::from_u64(16, 0xE73C))?;
                     }
 
                     // Execute at least >5 TCK cycles with TMS high to enter the Test-Logic-Reset state
-                    interface.swj_sequence(6, 0x3F)?;
+                    interface.swj_sequence(&BitSequence::from_u64(6, 0x3F))?;
 
                     // Enter Run-Test-Idle state, as required by the DAP_Transfer command when using JTAG
-                    interface.jtag_sequence(1, false, 0x01)?;
+                    interface.jtag_sequence(false, &BitSequence::from_u64(1, 0x01))?;
 
                     // Configure JTAG IR lengths in probe
                     interface.configure_jtag(false)?;
@@ -580,17 +577,17 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
                     if has_dormant {
                         // Select Dormant State (from JTAG)
                         tracing::debug!("SelectV1 Dormant State (from JTAG)");
-                        interface.swj_sequence(31, 0x33BBBBBA)?;
+                        interface.swj_sequence(&BitSequence::from_u64(31, 0x33BBBBBA))?;
 
                         // Leave dormant state
                         alert_sequence(interface)?;
 
                         // 4 cycles SWDIO/TMS LOW + 8-Bit SWD Activation Code (0x1A)
-                        interface.swj_sequence(12, 0x1A0)?;
+                        interface.swj_sequence(&BitSequence::from_u64(12, 0x1A0))?;
                     } else {
                         // Execute SWJ-DP Switch Sequence JTAG to SWD (0xE79E).
                         // Change if SWJ-DP uses deprecated switch code (0xEDB6).
-                        interface.swj_sequence(16, 0xE79E)?;
+                        interface.swj_sequence(&BitSequence::from_u64(16, 0xE79E))?;
 
                         // > 50 cycles SWDIO/TMS High, at least 2 idle cycles (SWDIO/TMS Low).
                         // -> done in debug_port_connect
@@ -629,6 +626,19 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     /// [ARM SVD Debug Description]: https://open-cmsis-pack.github.io/Open-CMSIS-Pack-Spec/main/html/debug_description.html#debugPortStart
     #[doc(alias = "DebugPortStart")]
     fn debug_port_start(
+        &self,
+        interface: &mut dyn DapAccess,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
+        self.debug_port_start_default(interface, dp)
+    }
+
+    /// The stock `DebugPortStart` implementation, split out from
+    /// [`debug_port_start`](ArmDebugSequence::debug_port_start) so that vendor sequences which
+    /// only need to *append* device-specific steps can run it without copying the body.
+    ///
+    /// There is no reason to override this; override `debug_port_start` and call this from it.
+    fn debug_port_start_default(
         &self,
         interface: &mut dyn DapAccess,
         dp: DpAddress,
@@ -676,34 +686,42 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
                 ctrl.set_mask_lane(0b1111);
             }
 
-            match interface
+            let mut err = interface
                 .write_dp_register(dp, ctrl.clone())
-                .and_then(|_| interface.flush())
-            {
-                Ok(()) => {}
-                Err(e @ ArmError::Dap(DapError::NoAcknowledge)) => {
-                    // If we get a NACK from the power-up request, ignore the error & perform a line reset.
-                    // (CMSIS-DAP transports read DP.RDBUFF right after a write to DP.CTRL_STAT.
-                    //  This fails in some cases on PSOC 6, for example if the device is waking from DeepSleep.
-                    //  If something really went wrong, we'll hit an error or timeout in the polling loop below.)
-                    let Some(probe) = interface.try_dap_probe_mut() else {
-                        tracing::warn!(
-                            "Power-up request returned NACK, but we don't have a DapProbe, so we can't reconnect"
-                        );
-                        return Err(e);
-                    };
-                    tracing::info!("Power-up request returned NACK, reconnecting");
-                    self.debug_port_connect(probe, dp)?;
-                }
-                Err(e) => return Err(e),
-            }
+                .and_then(|_| interface.flush());
 
             let start = Instant::now();
             loop {
-                let ctrl = interface.read_dp_register::<Ctrl>(dp)?;
-                if ctrl.csyspwrupack() && ctrl.cdbgpwrupack() {
-                    break;
+                match std::mem::replace(&mut err, Ok(()))
+                    .and_then(|_| interface.read_dp_register::<Ctrl>(dp))
+                {
+                    Ok(ctrl) => {
+                        if ctrl.csyspwrupack() && ctrl.cdbgpwrupack() {
+                            break;
+                        }
+                    }
+                    Err(e @ ArmError::Dap(DapError::NoAcknowledge)) => {
+                        // If we get a NACK from the power-up request, ignore the error & perform a
+                        // line reset. (On PSOC 6, the debug sometimes gives spurious NACKs while
+                        // the device is powering up. If something really went wrong, we'll hit
+                        // another error or timeout.)
+                        tracing::info!("Power-up request returned NACK, reconnecting");
+                        interface
+                            .debug_port_reconnect_with(&mut |wire| self.debug_port_connect(wire, dp))
+                            .map_err(|reconnect_err| {
+                                if matches!(reconnect_err, ArmError::NotImplemented(_)) {
+                                    tracing::warn!(
+                                        "Power-up request returned NACK, but reconnect is unavailable"
+                                    );
+                                    e
+                                } else {
+                                    reconnect_err
+                                }
+                            })?;
+                    }
+                    Err(e) => return Err(e),
                 }
+
                 if start.elapsed() >= Duration::from_secs(1) {
                     return Err(ArmError::Timeout);
                 }
@@ -746,9 +764,9 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ) -> Result<(), ArmError> {
         let mut core = interface.memory_interface(core_ap)?;
 
-        // Dispatch based on core type (Cortex-A vs M)
+        // Dispatch based on core type (Cortex-A/R vs M)
         match core_type {
-            CoreType::Armv7a => armv7a_core_start(&mut *core, debug_base),
+            CoreType::Armv7a | CoreType::Armv7r => armv7ar_core_start(&mut *core, debug_base),
             CoreType::Armv8a => armv8a_core_start(&mut *core, debug_base, cti_base),
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
                 cortex_m_core_start(&mut *core)
@@ -769,9 +787,9 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         core_type: CoreType,
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        // Dispatch based on core type (Cortex-A vs M)
+        // Dispatch based on core type (Cortex-A/R vs M)
         match core_type {
-            CoreType::Armv7a => armv7a_reset_catch_set(core, debug_base),
+            CoreType::Armv7a | CoreType::Armv7r => armv7ar_reset_catch_set(core, debug_base),
             CoreType::Armv8a => armv8a_reset_catch_set(core, debug_base),
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
                 cortex_m_reset_catch_set(core)
@@ -792,9 +810,9 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         core_type: CoreType,
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        // Dispatch based on core type (Cortex-A vs M)
+        // Dispatch based on core type (Cortex-A/R vs M)
         match core_type {
-            CoreType::Armv7a => armv7a_reset_catch_clear(core, debug_base),
+            CoreType::Armv7a | CoreType::Armv7r => armv7ar_reset_catch_clear(core, debug_base),
             CoreType::Armv8a => armv8a_reset_catch_clear(core, debug_base),
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
                 cortex_m_reset_catch_clear(core)
@@ -845,9 +863,9 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         core_type: CoreType,
         debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        // Dispatch based on core type (Cortex-A vs M)
+        // Dispatch based on core type (Cortex-A/R vs M)
         match core_type {
-            CoreType::Armv7a => armv7a_reset_system(interface, debug_base),
+            CoreType::Armv7a | CoreType::Armv7r => armv7ar_reset_system(interface, debug_base),
             CoreType::Armv8a => armv8a_reset_system(interface, debug_base),
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
                 cortex_m_reset_system(interface)
@@ -897,6 +915,19 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         interface: &mut dyn ArmMemoryInterface,
         core_type: CoreType,
     ) -> Result<(), ArmError> {
+        self.debug_core_stop_default(interface, core_type)
+    }
+
+    /// The stock `DebugCoreStop` implementation, split out from
+    /// [`debug_core_stop`](ArmDebugSequence::debug_core_stop) so that vendor sequences which only
+    /// need to *append* device-specific steps can run it without copying the body.
+    ///
+    /// There is no reason to override this; override `debug_core_stop` and call this from it.
+    fn debug_core_stop_default(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        core_type: CoreType,
+    ) -> Result<(), ArmError> {
         if core_type.is_cortex_m() {
             // System Control Space (SCS) offset as defined in Armv6-M/Armv7-M.
             // Disable Core Debug via DHCSR
@@ -918,18 +949,31 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     ///
     /// [ARM SVD Debug Description]: https://open-cmsis-pack.github.io/Open-CMSIS-Pack-Spec/main/html/debug_description.html#debugPortStop
     #[doc(alias = "DebugPortStop")]
-    fn debug_port_stop(&self, interface: &mut dyn DapProbe, dp: DpAddress) -> Result<(), ArmError> {
+    fn debug_port_stop(
+        &self,
+        interface: &mut dyn DebugPortWire,
+        dp: DpAddress,
+    ) -> Result<(), ArmError> {
         tracing::info!("Powering down debug port {dp:x?}");
         // Select Bank 0
-        interface.raw_write_register(SelectV1::ADDRESS.into(), 0)?;
+        interface.raw_write_register(
+            Port::Dp,
+            RegisterAddress::from(SelectV1::ADDRESS).a2_and_3(),
+            0,
+        )?;
 
         // De-assert debug power request
-        interface.raw_write_register(Ctrl::ADDRESS.into(), 0)?;
+        interface.raw_write_register(
+            Port::Dp,
+            RegisterAddress::from(Ctrl::ADDRESS).a2_and_3(),
+            0,
+        )?;
 
         // Wait for the power domains to go away
         let start = Instant::now();
         loop {
-            let ctrl = interface.raw_read_register(Ctrl::ADDRESS.into())?;
+            let ctrl = interface
+                .raw_read_register(Port::Dp, RegisterAddress::from(Ctrl::ADDRESS).a2_and_3())?;
             let ctrl = Ctrl(ctrl);
             if !(ctrl.csyspwrupack() || ctrl.cdbgpwrupack()) {
                 return Ok(());
@@ -956,7 +1000,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
     #[tracing::instrument(level = "debug", skip_all)]
     fn debug_port_connect(
         &self,
-        interface: &mut dyn DapProbe,
+        interface: &mut dyn DebugPortWire,
         dp: DpAddress,
     ) -> Result<(), ArmError> {
         match interface.active_protocol() {
@@ -998,18 +1042,25 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
 
                 // Should this be a swd_sequence?
                 // Technically we shouldn't drive SWDIO all the time when sending a request.
-                interface.swj_sequence(6 * 8, data)?;
+                interface.swj_sequence(&BitSequence::from_bytes(&data.to_le_bytes(), 6 * 8))?;
             }
 
             tracing::debug!("Reading DPIDR to enable SWD interface");
 
             // Read DPIDR to enable SWD interface.
-            match interface.raw_read_register(RegisterAddress::DpRegister(DPIDR::ADDRESS)) {
+            match interface.raw_read_register(
+                Port::Dp,
+                RegisterAddress::DpRegister(DPIDR::ADDRESS).a2_and_3(),
+            ) {
                 Ok(x) => break x,
                 Err(z) => {
                     if guard.elapsed() > RESET_RECOVERY_TIMEOUT {
                         tracing::debug!("DPIDR didn't become readable within guard time");
-                        return Err(z);
+                        // The debug port never acknowledged the initial read, which usually
+                        // means nothing is listening on the wire.
+                        return Err(ArmError::NoTargetResponse {
+                            source: Box::new(z),
+                        });
                     }
                 }
             }
@@ -1031,7 +1082,11 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         abort.set_stkcmpclr(true);
 
         // DPBANKSEL does not matter for ABORT
-        interface.raw_write_register(Abort::ADDRESS.into(), abort.0)?;
+        interface.raw_write_register(
+            Port::Dp,
+            RegisterAddress::from(Abort::ADDRESS).a2_and_3(),
+            abort.0,
+        )?;
         interface.raw_flush()?;
 
         // Check that we are connected to the right DP
@@ -1039,13 +1094,25 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         if let DpAddress::Multidrop(targetsel) = dp {
             tracing::debug!("Checking TARGETID and DLPIDR match");
             // Select DP Bank 2
-            interface.raw_write_register(SelectV1::ADDRESS.into(), 2)?;
+            interface.raw_write_register(
+                Port::Dp,
+                RegisterAddress::from(SelectV1::ADDRESS).a2_and_3(),
+                2,
+            )?;
 
-            let target_id = interface.raw_read_register(TARGETID::ADDRESS.into())?;
+            let target_id = interface.raw_read_register(
+                Port::Dp,
+                RegisterAddress::from(TARGETID::ADDRESS).a2_and_3(),
+            )?;
 
             // Select DP Bank 3
-            interface.raw_write_register(SelectV1::ADDRESS.into(), 3)?;
-            let dlpidr = interface.raw_read_register(DLPIDR::ADDRESS.into())?;
+            interface.raw_write_register(
+                Port::Dp,
+                RegisterAddress::from(SelectV1::ADDRESS).a2_and_3(),
+                3,
+            )?;
+            let dlpidr = interface
+                .raw_read_register(Port::Dp, RegisterAddress::from(DLPIDR::ADDRESS).a2_and_3())?;
 
             const TARGETID_MASK: u32 = 0x0FFF_FFFF;
             const DLPIDR_MASK: u32 = 0xF000_0000;
@@ -1065,8 +1132,14 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
             }
         }
 
-        interface.raw_write_register(SelectV1::ADDRESS.into(), 0)?;
-        let ctrl_stat = interface.raw_read_register(Ctrl::ADDRESS.into()).map(Ctrl);
+        interface.raw_write_register(
+            Port::Dp,
+            RegisterAddress::from(SelectV1::ADDRESS).a2_and_3(),
+            0,
+        )?;
+        let ctrl_stat = interface
+            .raw_read_register(Port::Dp, RegisterAddress::from(Ctrl::ADDRESS).a2_and_3())
+            .map(Ctrl);
 
         match ctrl_stat {
             Ok(ctrl_stat) => {
@@ -1082,7 +1155,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         Ok(())
     }
 
-    /// This ARM sequence is called if an image was flashed to RAM directly. It should perform the
+    /// This sequence is called if an image was flashed to RAM directly. It should perform the
     /// necessary preparation to run that image on the core with the ID passed to the function.
     ///
     /// The core should already be `reset_and_halt`ed right before this call.
@@ -1097,8 +1170,8 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         let mut core = session.core(core_id)?;
         let core_type = core.core_type();
         match core_type {
-            CoreType::Armv7a | CoreType::Armv8a => {
-                tracing::debug!("RAM flash start for Cortex-A core with ID {}", core_id);
+            CoreType::Armv7a | CoreType::Armv7r | CoreType::Armv8a => {
+                tracing::debug!("RAM flash start for Cortex-A/R core with ID {}", core_id);
                 core.write_core_reg(PC.id, vector_table_addr)?;
             }
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
@@ -1126,8 +1199,27 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         Ok(())
     }
 
+    /// Called before attaching to a core.
+    fn on_attach(
+        &self,
+        _interface: &mut dyn ArmDebugInterface,
+        _ap: &FullyQualifiedApAddress,
+        _core_type: CoreType,
+    ) -> Result<(), ArmError> {
+        Ok(())
+    }
+
     /// Return the Debug Erase Sequence implementation if it exists
     fn debug_erase_sequence(&self) -> Option<Arc<dyn DebugEraseSequence>> {
+        None
+    }
+
+    /// Return the Debug Flash Sequence implementation if it exists.
+    ///
+    /// This is used for host-side flash programming where the flash
+    /// operations are performed from the host via debug interface commands
+    /// rather than a RAM-based flash algorithm.
+    fn debug_flash_sequence(&self) -> Option<Arc<dyn DebugFlashSequence>> {
         None
     }
 
@@ -1156,11 +1248,11 @@ pub trait DebugEraseSequence: Send + Sync {
 /// Perform a SWD line reset (SWDIO high for 50 clock cycles)
 ///
 /// After the line reset, SWDIO will be kept low for `swdio_low_cycles` cycles.
-fn swd_line_reset(interface: &mut dyn DapProbe, swdio_low_cycles: u8) -> Result<(), ArmError> {
-    assert!(swdio_low_cycles + 51 <= 64);
-
+fn swd_line_reset(interface: &mut dyn DebugPortWire, swdio_low_cycles: u8) -> Result<(), ArmError> {
     tracing::debug!("Performing SWD line reset");
-    interface.swj_sequence(51 + swdio_low_cycles, 0x0007_FFFF_FFFF_FFFF)?;
+    let mut sequence = BitSequence::repeat(true, 51);
+    sequence.extend(&BitSequence::repeat(false, swdio_low_cycles as usize));
+    interface.swj_sequence(&sequence)?;
 
     Ok(())
 }

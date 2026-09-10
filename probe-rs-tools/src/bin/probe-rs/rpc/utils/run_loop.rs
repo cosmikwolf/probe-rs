@@ -5,13 +5,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use probe_rs::{Core, Error, HaltReason, VectorCatchCondition};
+use probe_rs::{Core, CoreType, Error, HaltReason, VectorCatchCondition};
 
-use crate::rpc::{ObjectStorage, SessionState};
+use crate::rpc::SessionState;
 
 pub struct RunLoop {
     pub core_id: usize,
     pub cancellation_token: CancellationToken,
+}
+
+/// Configuration for which vector catches to enable during the run loop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VectorCatchConfig {
+    pub catch_hardfault: bool,
+    pub catch_reset: bool,
+    pub catch_svc: bool,
+    pub catch_hlt: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -26,20 +35,30 @@ pub enum ReturnReason<R> {
     LockedUp,
 }
 
+/// Default interval between status polls of the primary core when RTT does not request a faster poll.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Interval between status polls of other cores. Longer than the primary interval to limit probe traffic.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 impl RunLoop {
-    /// Attaches to RTT and runs the core until it halts.
+    /// Attaches to RTT and runs the primary core until it, or another enabled core, halts.
+    ///
+    /// Vector catch, the initial resume, and the poller run only on [`Self::core_id`]. Other cores
+    /// are observed with `status()` only. A disabled hart is skipped and retried later. An
+    /// unexpected halt, lock-up, or semihosting result on any observed core uses the same predicate
+    /// as the primary core.
     ///
     /// Upon halt the predicate is invoked with the halt reason:
     /// * If the predicate returns `Ok(Some(r))` the run loop returns `Ok(ReturnReason::Predicate(r))`.
-    /// * If the predicate returns `Ok(None)` the run loop will continue running the core.
+    /// * If the predicate returns `Ok(None)` the run loop will continue running the core that halted.
     /// * If the predicate returns `Err(e)` the run loop will return `Err(e)`.
     ///
-    /// The function will also return on timeout with `Ok(ReturnReason::Timeout)` or if the user presses CTRL + C with `Ok(ReturnReason::User)`.
+    /// The function will also return on timeout with `Ok(ReturnReason::Timeout)` or if the user presses CTRL + C with `Ok(ReturnReason::Cancelled)`.
     pub fn run_until<F, R>(
         &mut self,
         shared_session: &SessionState<'_>,
-        catch_hardfault: bool,
-        catch_reset: bool,
+        vector_catch: VectorCatchConfig,
         mut poller: impl RunLoopPoller,
         timeout: Option<Duration>,
         mut predicate: F,
@@ -47,31 +66,62 @@ impl RunLoop {
     where
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
+        let VectorCatchConfig {
+            catch_hardfault,
+            catch_reset,
+            catch_svc,
+            catch_hlt,
+        } = vector_catch;
+
         // Prepare run loop
         {
             let mut session = shared_session.session_blocking();
             let mut core = session.core(self.core_id)?;
-            if catch_hardfault || catch_reset {
+            let needs_vector_catch = catch_hardfault || catch_reset || catch_svc || catch_hlt;
+
+            if needs_vector_catch {
                 if !core.core_halted()? {
                     core.halt(Duration::from_millis(100))?;
                 }
 
-                if catch_hardfault {
-                    match core.enable_vector_catch(VectorCatchCondition::HardFault) {
-                        Ok(_) | Err(Error::NotImplemented(_)) => {} // Don't output an error if vector_catch hasn't been implemented
-                        Err(e) => tracing::error!("Failed to enable_vector_catch: {:?}", e),
+                // For ARMv7-A/R and ARMv8-A cores: if we're at the reset vector (PC = 0), step
+                // past it first. This happens after reset_and_halt - enabling the reset catch
+                // while at the reset vector causes an immediate halt.
+                if catch_reset
+                    && matches!(
+                        core.core_type(),
+                        CoreType::Armv7a | CoreType::Armv7r | CoreType::Armv8a
+                    )
+                {
+                    let pc: u64 = core.read_core_reg(core.program_counter())?;
+                    if pc == 0 {
+                        core.step()?;
                     }
                 }
-                if catch_reset {
-                    match core.enable_vector_catch(VectorCatchCondition::CoreReset) {
-                        Ok(_) | Err(Error::NotImplemented(_)) => {} // Don't output an error if vector_catch hasn't been implemented
-                        Err(e) => tracing::error!("Failed to enable_vector_catch: {:?}", e),
+
+                let catches = [
+                    (catch_hardfault, VectorCatchCondition::HardFault),
+                    (catch_reset, VectorCatchCondition::CoreReset),
+                    (catch_svc, VectorCatchCondition::Svc),
+                    (catch_hlt, VectorCatchCondition::Hlt),
+                ];
+
+                for (enabled, condition) in catches {
+                    let result = if enabled {
+                        core.enable_vector_catch(condition)
+                    } else {
+                        core.disable_vector_catch(condition)
+                    };
+                    match result {
+                        Ok(_) | Err(Error::NotImplemented(_)) => {}
+                        Err(e) => {
+                            tracing::error!("Failed to set vector catch {:?}: {:?}", condition, e)
+                        }
                     }
                 }
             }
 
-            let object_storage = shared_session.object_storage();
-            poller.start(&object_storage, &mut core)?;
+            poller.start(&mut core)?;
 
             if core.core_halted()? {
                 core.run()?;
@@ -83,9 +133,8 @@ impl RunLoop {
         // Clean up run loop
         let mut session = shared_session.session_blocking();
         let mut core = session.core(self.core_id)?;
-        let object_storage = shared_session.object_storage();
         // Always clean up after RTT but don't overwrite the original result.
-        let poller_exit_result = poller.exit(&object_storage, &mut core);
+        let poller_exit_result = poller.exit(&mut core);
         if result.is_ok() {
             // If the result is Ok, we return the potential error during cleanup.
             poller_exit_result?;
@@ -105,45 +154,108 @@ impl RunLoop {
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
         let start = Instant::now();
+        let core_count = shared_session.session_blocking().target().cores.len();
+        let mut next_wakeup = vec![start; core_count];
 
         loop {
-            match self.poll_once(shared_session, poller, predicate)? {
-                ControlFlow::Break(reason) => return Ok(reason),
-                ControlFlow::Continue(next_poll) => {
-                    if let Some(timeout) = timeout
-                        && start.elapsed() >= timeout
-                    {
-                        return Ok(ReturnReason::Timeout);
+            let mut next_poll;
+
+            {
+                let mut session = shared_session.session_blocking();
+
+                {
+                    let mut core = session.core(self.core_id)?;
+                    match self.poll_core(&mut core, true, poller, predicate)? {
+                        ControlFlow::Break(reason) => return Ok(reason),
+                        ControlFlow::Continue(duration) => next_poll = duration,
+                    }
+                }
+
+                if self.cancellation_token.is_cancelled() {
+                    return Ok(ReturnReason::Cancelled);
+                }
+
+                let now = Instant::now();
+                for (idx, wakeup) in next_wakeup.iter_mut().enumerate() {
+                    if idx == self.core_id {
+                        continue;
                     }
 
-                    // If the polling frequency is too high, the USB connection to the probe
-                    // can become unstable. Hence we only poll as little as necessary.
-                    thread::sleep(next_poll);
+                    if now < *wakeup {
+                        next_poll = next_poll.min(wakeup.saturating_duration_since(now));
+                        continue;
+                    }
+
+                    let mut core = match session.core(idx) {
+                        Ok(core) => core,
+                        Err(Error::CoreDisabled(_)) => {
+                            // Retry on the next primary poll so a hart that leaves reset is
+                            // configured before it can panic.
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Skipping core {idx} while the run loop observes it: {error}"
+                            );
+                            *wakeup = Instant::now() + WATCH_POLL_INTERVAL;
+                            next_poll = next_poll.min(WATCH_POLL_INTERVAL);
+                            continue;
+                        }
+                    };
+
+                    match self.poll_core(&mut core, false, poller, predicate) {
+                        Ok(ControlFlow::Break(reason)) => return Ok(reason),
+                        Ok(ControlFlow::Continue(duration)) => {
+                            *wakeup = Instant::now() + duration;
+                            next_poll = next_poll.min(duration);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Skipping core {idx} while the run loop observes it: {error}"
+                            );
+                            *wakeup = Instant::now() + WATCH_POLL_INTERVAL;
+                            next_poll = next_poll.min(WATCH_POLL_INTERVAL);
+                        }
+                    }
+
+                    if self.cancellation_token.is_cancelled() {
+                        return Ok(ReturnReason::Cancelled);
+                    }
                 }
             }
+
+            if let Some(timeout) = timeout
+                && start.elapsed() >= timeout
+            {
+                return Ok(ReturnReason::Timeout);
+            }
+
+            // If the polling frequency is too high, the USB connection to the probe
+            // can become unstable. Hence we only poll as little as necessary.
+            thread::sleep(next_poll);
         }
     }
 
-    fn poll_once<F, R>(
+    fn poll_core<F, R>(
         &self,
-        shared_session: &SessionState<'_>,
+        core: &mut Core<'_>,
+        is_primary: bool,
         poller: &mut impl RunLoopPoller,
         predicate: &mut F,
     ) -> Result<ControlFlow<ReturnReason<R>, Duration>>
     where
         F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
     {
-        let mut session = shared_session.session_blocking();
-        let mut core = session.core(self.core_id)?;
+        let mut next_poll = if is_primary {
+            DEFAULT_POLL_INTERVAL
+        } else {
+            WATCH_POLL_INTERVAL
+        };
 
-        let mut next_poll = Duration::from_millis(100);
-        let object_storage = shared_session.object_storage();
-
-        // check for halt first, poll rtt after.
-        // this is important so we do one last poll after halt, so we flush all messages
-        // the core printed before halting, such as a panic message.
+        // Check for halt first. Poll RTT after on the primary core so one last poll after halt
+        // flushes messages the core printed before halting, such as a panic message.
         let return_reason = match core.status()? {
-            probe_rs::CoreStatus::Halted(reason) => match predicate(reason, &mut core) {
+            probe_rs::CoreStatus::Halted(reason) => match predicate(reason, core) {
                 Ok(Some(r)) => Some(Ok(ReturnReason::Predicate(r))),
                 Err(e) => Some(Err(e)),
                 Ok(None) => {
@@ -164,17 +276,15 @@ impl RunLoop {
             probe_rs::CoreStatus::LockedUp => Some(Ok(ReturnReason::LockedUp)),
         };
 
-        let poller_result = poller.poll(&object_storage, &mut core);
+        if is_primary {
+            let poller_result = poller.poll(core);
 
-        if let Some(reason) = return_reason {
+            if let Some(reason) = return_reason {
+                return reason.map(ControlFlow::Break);
+            }
+            next_poll = next_poll.min(poller_result?);
+        } else if let Some(reason) = return_reason {
             return reason.map(ControlFlow::Break);
-        }
-        if self.cancellation_token.is_cancelled() {
-            return Ok(ControlFlow::Break(ReturnReason::Cancelled));
-        }
-        match poller_result {
-            Ok(delay) => next_poll = next_poll.min(delay),
-            Err(error) => return Err(error),
         }
 
         Ok(ControlFlow::Continue(next_poll))
@@ -182,23 +292,23 @@ impl RunLoop {
 }
 
 pub trait RunLoopPoller {
-    fn start(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<()>;
-    fn poll(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<Duration>;
-    fn exit(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<()>;
+    fn start(&mut self, core: &mut Core<'_>) -> Result<()>;
+    fn poll(&mut self, core: &mut Core<'_>) -> Result<Duration>;
+    fn exit(&mut self, core: &mut Core<'_>) -> Result<()>;
 }
 
 pub struct NoopPoller;
 
 impl RunLoopPoller for NoopPoller {
-    fn start(&mut self, _: &ObjectStorage, _core: &mut Core<'_>) -> Result<()> {
+    fn start(&mut self, _core: &mut Core<'_>) -> Result<()> {
         Ok(())
     }
 
-    fn poll(&mut self, _: &ObjectStorage, _core: &mut Core<'_>) -> Result<Duration> {
+    fn poll(&mut self, _core: &mut Core<'_>) -> Result<Duration> {
         Ok(Duration::from_secs(u64::MAX))
     }
 
-    fn exit(&mut self, _: &ObjectStorage, _core: &mut Core<'_>) -> Result<()> {
+    fn exit(&mut self, _core: &mut Core<'_>) -> Result<()> {
         Ok(())
     }
 }
@@ -207,27 +317,27 @@ impl<T> RunLoopPoller for Option<T>
 where
     T: RunLoopPoller,
 {
-    fn start(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<()> {
+    fn start(&mut self, core: &mut Core<'_>) -> Result<()> {
         if let Some(poller) = self {
-            poller.start(objs, core)
+            poller.start(core)
         } else {
-            NoopPoller.start(objs, core)
+            NoopPoller.start(core)
         }
     }
 
-    fn poll(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<Duration> {
+    fn poll(&mut self, core: &mut Core<'_>) -> Result<Duration> {
         if let Some(poller) = self {
-            poller.poll(objs, core)
+            poller.poll(core)
         } else {
-            NoopPoller.poll(objs, core)
+            NoopPoller.poll(core)
         }
     }
 
-    fn exit(&mut self, objs: &ObjectStorage, core: &mut Core<'_>) -> Result<()> {
+    fn exit(&mut self, core: &mut Core<'_>) -> Result<()> {
         if let Some(poller) = self {
-            poller.exit(objs, core)
+            poller.exit(core)
         } else {
-            NoopPoller.exit(objs, core)
+            NoopPoller.exit(core)
         }
     }
 }
