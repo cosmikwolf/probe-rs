@@ -1083,6 +1083,38 @@ impl ArmDebugSequence for Kinetis {
         Ok(())
     }
 
+    fn debug_core_stop(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        core_type: crate::CoreType,
+    ) -> Result<(), ArmError> {
+        use crate::architecture::arm::core::armv7m::Dhcsr;
+
+        // After a flash the core is left halted on the flash routine's `bkpt`
+        // (PC in RAM, LR = the trampoline). Disabling C_DEBUGEN and letting it
+        // run from there executes the `bkpt` with debug off, which is a
+        // HardFault. Firmware that records faults and reboots sees a bogus
+        // fault on every download (pc=0x1fff8000). Reset instead, so the
+        // firmware boots clean; the reset follows the usual WDOG policy.
+        const DCRDR: u64 = 0xE000_EDF8;
+        const DCRSR: u64 = 0xE000_EDF4;
+        let dhcsr = interface.read_word_32(Dhcsr::get_mmio_address())?;
+        if (dhcsr & (1 << 17)) != 0 {
+            interface.write_word_32(DCRSR, 15)?;
+            let pc = interface.read_word_32(DCRDR)?;
+            let insn = interface.read_word_16(pc as u64 & !1).unwrap_or(0);
+            if (insn & 0xFF00) == 0xBE00 {
+                tracing::info!(
+                    "Kinetis: core is halted on a bkpt at {pc:#010x} (flash routine); \
+                     resetting before debug is disabled so the firmware boots clean"
+                );
+                self.reset_system(interface, core_type, None)?;
+            }
+        }
+
+        self.debug_core_stop_default(interface, core_type)
+    }
+
     fn debug_erase_sequence(&self) -> Option<Arc<dyn DebugEraseSequence>> {
         Some(Arc::new(KinetisEraseSequence))
     }
