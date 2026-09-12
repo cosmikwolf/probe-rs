@@ -191,6 +191,7 @@ impl ProbeFactory for JLinkFactory {
             swo_config: None,
             speed_khz: 0, // default is unknown
             swd_settings: SwdSettings::default(),
+            reset_asserted: false,
             jtag_state: JtagChainState::default(),
             force_legacy_jtag_command: selector.product_id == 0x0101,
 
@@ -400,6 +401,10 @@ pub struct JLink {
     max_mem_block_size: usize,
 
     swd_settings: SwdSettings,
+
+    /// True while this handle holds nRST asserted via `target_reset_assert`.
+    /// `attach` must not release a reset the caller asked for (connect under reset).
+    reset_asserted: bool,
 }
 
 impl fmt::Debug for JLink {
@@ -1081,7 +1086,14 @@ impl DebugProbe for JLink {
             }
         }
 
-        self.write_cmd(&[Command::HwReset1 as u8])?;
+        // Release nRST only if nobody asked for it to be held. `Session::attach_under_reset`
+        // asserts nRST *before* calling `attach`; releasing it here turned connect-under-reset
+        // into a short pulse and the target ran through the whole DP bring-up and vendor unlock.
+        if self.reset_asserted {
+            tracing::debug!("J-Link: nRST is held by the caller, not releasing it in attach");
+        } else {
+            self.write_cmd(&[Command::HwReset1 as u8])?;
+        }
         self.write_cmd(&[Command::HwTrst1 as u8])?;
 
         // Set a default speed if not already set
@@ -1105,11 +1117,13 @@ impl DebugProbe for JLink {
 
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
         self.set_reset(false)?;
+        self.reset_asserted = true;
         Ok(())
     }
 
     fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
         self.set_reset(true)?;
+        self.reset_asserted = false;
         Ok(())
     }
 

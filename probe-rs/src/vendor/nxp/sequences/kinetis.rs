@@ -35,12 +35,30 @@
 //!   algorithm included) is subject to the rule, so the WDOG has to be
 //!   disabled first. That is what `disable_wdog` is for, and why jlinkexe and
 //!   OpenOCD both carry the same step.
-//! - A `Session::attach` that disables the WDOG **hides the firmware bug**:
-//!   under probe-rs the firmware boots and runs, standalone it never reaches
-//!   `main`. When a Kinetis target "only works with the debugger attached", or
-//!   fails MEM-AP transfers intermittently, check `RCM_SRS0` before suspecting
-//!   the debug sequence. Reading it needs the MDM-AP CORE_HOLD_RES control bit armed and a
+//! - A reset that disables the WDOG **hides the firmware bug**: under probe-rs
+//!   the firmware boots and runs, standalone it never reaches `main`. When a
+//!   Kinetis target "only works with the debugger attached", or fails MEM-AP
+//!   transfers intermittently, check `RCM_SRS0` before suspecting the debug
+//!   sequence. Reading it needs the MDM-AP CORE_HOLD_RES control bit armed and a
 //!   wait for the firmware's own next reset; a plain MEM-AP read fails.
+//!
+//! # Policy (since 2026-09-11)
+//!
+//! - A plain `Session::attach` to a running, unsecured chip does **not** reset
+//!   it, does not halt it, and does not touch the WDOG. `debug_device_unlock`
+//!   samples MDM-AP STATUS first and only reaches for `SYS_RES_REQ` when the
+//!   system state is unstable (a reset-looping firmware); it logs a warning
+//!   when it does.
+//! - Every reset this sequence causes (`reset_system`, the unstable-attach
+//!   path, connect under reset) is followed by `disable_wdog` while the core
+//!   is halted at the reset vector, the same as jlinkexe and OpenOCD. RAM and
+//!   registers the routine uses are restored.
+//! - `VC_CORERESET` is only armed between `reset_catch_set` and
+//!   `reset_catch_clear`; nothing leaves it set across a session.
+//! - Connect under reset (nRST held): the security state comes from MDM-AP
+//!   `SYSSEC` directly, `reset_catch_set` arms `CORE_HOLD_RES` because the
+//!   AHB-AP is unreachable while nRST is low, and `reset_hardware_deassert`
+//!   converts the hold into a proper `VC_CORERESET` halt.
 //!
 //! The unlock itself (two writes to WDOG_UNLOCK within 20 bus cycles) is too
 //! fast for SWD, so `disable_wdog` uploads a 32-byte Thumb routine to SRAM and
@@ -57,7 +75,7 @@ use crate::MemoryMappedRegister;
 use crate::architecture::arm::{
     ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
     memory::ArmMemoryInterface,
-    sequences::{ArmDebugSequence, ArmDebugSequenceError, DebugEraseSequence},
+    sequences::{ArmDebugSequence, ArmDebugSequenceError, DebugEraseSequence, DefaultArmSequence},
 };
 use crate::session::MissingPermissions;
 
@@ -84,6 +102,51 @@ const K_SERIES_MDM_ID: u32 = 0x001C_0000;
 #[derive(Debug)]
 pub struct Kinetis;
 
+/// What the MDM-AP says about the system before the sequence touches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemState {
+    /// `FREADY=1`, `SYSRES=1` on every sample: flash ready, system out of reset.
+    Running,
+    /// `FREADY=1`, `SYSRES=0` on every sample: somebody (nRST) holds the system in
+    /// reset. The MDM-AP answers, the AHB-AP does not.
+    HeldInReset,
+    /// Anything else: the system is going in and out of reset (a reset-looping
+    /// firmware, see the module docs) or flash is not ready.
+    Unstable,
+}
+
+/// Sample MDM-AP STATUS and classify the system. Also returns whether the
+/// majority of samples had `SYSSEC` set. Reads only; nothing is reset.
+fn sample_system_state(iface: &mut dyn DapAccess) -> Result<(SystemState, bool), ArmError> {
+    const SAMPLES: u32 = 16;
+    let (mut running, mut held, mut secured) = (0u32, 0u32, 0u32);
+    for _ in 0..SAMPLES {
+        let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
+        let fready = (status & MDM_STAT_FREADY) != 0;
+        let out_of_reset = (status & MDM_STAT_SYSRES) != 0;
+        match (fready, out_of_reset) {
+            (true, true) => running += 1,
+            (true, false) => held += 1,
+            _ => {}
+        }
+        if (status & MDM_STAT_SYSSEC) != 0 {
+            secured += 1;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let state = if running == SAMPLES {
+        SystemState::Running
+    } else if held == SAMPLES {
+        SystemState::HeldInReset
+    } else {
+        SystemState::Unstable
+    };
+    tracing::debug!(
+        "Kinetis system state: {state:?} (running {running}/{SAMPLES}, held {held}/{SAMPLES}, SYSSEC {secured}/{SAMPLES})"
+    );
+    Ok((state, secured > SAMPLES / 2))
+}
+
 impl Kinetis {
     /// Create a new Kinetis debug sequence.
     pub fn create() -> Arc<dyn ArmDebugSequence> {
@@ -92,8 +155,12 @@ impl Kinetis {
 
     /// Set C_DEBUGEN + VC_CORERESET via MEM-AP, then release CORE_HOLD_RES.
     ///
-    /// Requires CORE_HOLD_RES active (from `mdm_halt`). The core exits the held
+    /// Requires CORE_HOLD_RES active (from `mdm_halt`, or from `reset_catch_set`
+    /// while nRST was held) and the system out of reset. The core exits the held
     /// state and immediately halts via VC_CORERESET, giving proper S_HALT=1.
+    /// The caller owns the armed VC_CORERESET and must clear it (`reset_catch_clear`
+    /// or `release_and_run`) — leaving it armed halts the core on every later
+    /// reset, including the firmware's own.
     fn enter_debug_halt(
         &self,
         iface: &mut dyn ArmDebugInterface,
@@ -135,12 +202,40 @@ impl Kinetis {
             thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// Counterpart of `enter_debug_halt` for a core that should end up running:
+    /// disable the WDOG (the reset re-armed it), disarm VC_CORERESET, resume.
+    fn release_and_run(
+        &self,
+        iface: &mut dyn ArmDebugInterface,
+        core_ap: &FullyQualifiedApAddress,
+    ) -> Result<(), ArmError> {
+        use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
+
+        let mut core = iface.memory_interface(core_ap)?;
+
+        if let Err(e) = disable_wdog(&mut *core) {
+            tracing::warn!("Kinetis: WDOG disable failed ({e}), firmware must handle WDOG");
+        }
+
+        let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
+        demcr.set_vc_corereset(false);
+        core.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
+
+        let mut dhcsr = Dhcsr(0);
+        dhcsr.set_c_debugen(true);
+        dhcsr.enable_write();
+        core.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        tracing::debug!("Kinetis: core resumed, VC_CORERESET cleared");
+        Ok(())
+    }
 }
 
 /// Check if the device is secured by sampling SYSSEC with FREADY+SYSRES gating.
 ///
 /// SYSSEC is unreliable during reset (ref manual Section 9.7) — only trust reads
-/// where FREADY=1 AND SYSRES=1. Call `mdm_halt()` first to stabilize the system.
+/// where FREADY=1 AND SYSRES=1. For a system held in reset by nRST use
+/// `sample_system_state` instead; there `SYSRES` never becomes 1.
 fn is_secured(iface: &mut dyn DapAccess) -> Result<bool, ArmError> {
     let mdm_ap = &MDM_AP;
 
@@ -181,8 +276,13 @@ fn is_secured(iface: &mut dyn DapAccess) -> Result<bool, ArmError> {
     );
 
     if valid_count == 0 {
-        tracing::warn!("Kinetis: no valid security reads — assuming secured");
-        return Ok(true);
+        // Guessing "secured" here used to send an unsecured chip straight to a
+        // mass erase. Refuse instead; the caller can retry or connect under reset.
+        return Err(ArmError::Other(
+            "Kinetis: could not read the security state (FREADY+SYSRES never both set); \
+             refusing to guess. Is the system held in reset or reset-looping?"
+                .into(),
+        ));
     }
 
     Ok(secured_count > valid_count / 2)
@@ -614,13 +714,13 @@ fn kinetis_mass_erase_no_nrst(iface: &mut dyn ArmDebugInterface) -> Result<(), A
 /// Disable the WDOG by uploading a 32-byte Thumb routine to SRAM and executing it.
 ///
 /// The WDOG unlock requires two writes within 20 bus cycles — too fast for SWD.
-/// Core must be halted. Based on OpenOCD's `armv7m_kinetis_wdog.s`.
+/// Core must be halted (S_HALT=1). Based on OpenOCD's `armv7m_kinetis_wdog.s`.
 ///
-/// Why this exists at all: see the module docs on the 256-cycle rule. Known
-/// limits as of 2026-09-10: the routine is staged at `ALGO_ADDR` (0x2000_0000,
-/// SRAM_U base) over live firmware RAM and is not restored, and it is only
-/// reached from `reset_catch_clear`, so an attach that does not go through
-/// `reset_and_halt` leaves the WDOG enabled.
+/// Why this exists at all: see the module docs on the 256-cycle rule. Policy: it
+/// runs after *every* reset this sequence causes (`debug_device_unlock`'s
+/// stabilising reset, `reset_system`, connect under reset), never after an
+/// attach that left the firmware running. The routine is staged at `ALGO_ADDR`
+/// and the clobbered RAM and registers (R0, R2, R4, PC) are restored afterwards.
 fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     use crate::architecture::arm::core::armv7m::Dhcsr;
 
@@ -641,6 +741,13 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
     const ALGO_ADDR: u32 = 0x2000_0000; // SRAM_U base
     const DCRDR: u64 = 0xE000_EDF8;
     const DCRSR: u64 = 0xE000_EDF4;
+    const DFSR: u64 = 0xE000_ED30;
+    const DFSR_BKPT: u32 = 1 << 1;
+    const REG_R0: u32 = 0;
+    const REG_R2: u32 = 2;
+    const REG_R4: u32 = 4;
+    const REG_PC: u32 = 15;
+    const DCRSR_WRITE: u32 = 1 << 16;
 
     tracing::debug!("Kinetis: disabling WDOG via uploaded algorithm");
     match core.read_word_32(Dhcsr::get_mmio_address()) {
@@ -655,17 +762,27 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
         }
     }
 
-    core.write_word_32(DCRSR, 15)?;
-    let saved_pc = core.read_word_32(DCRDR)?;
+    let read_reg = |core: &mut dyn ArmMemoryInterface, reg: u32| -> Result<u32, ArmError> {
+        core.write_word_32(DCRSR, reg)?;
+        core.read_word_32(DCRDR)
+    };
+    let write_reg =
+        |core: &mut dyn ArmMemoryInterface, reg: u32, val: u32| -> Result<(), ArmError> {
+            core.write_word_32(DCRDR, val)?;
+            core.write_word_32(DCRSR, DCRSR_WRITE | reg)
+        };
 
-    for (i, &word) in WDOG_ALGO.iter().enumerate() {
-        core.write_word_32(ALGO_ADDR as u64 + i as u64 * 4, word)?;
-    }
+    // Save everything the routine clobbers.
+    let saved_pc = read_reg(core, REG_PC)?;
+    let saved_r0 = read_reg(core, REG_R0)?;
+    let saved_r2 = read_reg(core, REG_R2)?;
+    let saved_r4 = read_reg(core, REG_R4)?;
+    let mut saved_ram = [0u32; WDOG_ALGO.len()];
+    core.read_32(ALGO_ADDR as u64, &mut saved_ram)?;
 
-    core.write_word_32(DCRDR, WDOG_BASE)?;
-    core.write_word_32(DCRSR, 1 << 16)?; // Write R0
-    core.write_word_32(DCRDR, ALGO_ADDR)?;
-    core.write_word_32(DCRSR, (1 << 16) | 15)?; // PC
+    core.write_32(ALGO_ADDR as u64, &WDOG_ALGO)?;
+    write_reg(core, REG_R0, WDOG_BASE)?;
+    write_reg(core, REG_PC, ALGO_ADDR)?;
 
     // Resume — algorithm hits bkpt when done
     let mut dhcsr = Dhcsr(0);
@@ -690,9 +807,17 @@ fn disable_wdog(core: &mut dyn ArmMemoryInterface) -> Result<(), ArmError> {
         thread::sleep(Duration::from_millis(1));
     }
 
-    core.write_word_32(DCRDR, saved_pc)?;
-    core.write_word_32(DCRSR, (1 << 16) | 15)?; // PC
-    let stctrlh = core.read_word_32(WDOG_BASE as u64)?;
+    // Restore. The bkpt also latched DFSR.BKPT, which would make the core
+    // status read `Breakpoint`; clear it (write-one-to-clear).
+    write_reg(core, REG_PC, saved_pc)?;
+    write_reg(core, REG_R0, saved_r0)?;
+    write_reg(core, REG_R2, saved_r2)?;
+    write_reg(core, REG_R4, saved_r4)?;
+    core.write_32(ALGO_ADDR as u64, &saved_ram)?;
+    core.write_word_32(DFSR, DFSR_BKPT)?;
+
+    // WDOG registers are 16-bit; a 32-bit read faults on the peripheral bus.
+    let stctrlh = core.read_word_16(WDOG_BASE as u64)?;
     if (stctrlh & 1) == 0 {
         tracing::debug!("Kinetis WDOG disabled successfully (STCTRLH = {stctrlh:#06x})");
     } else {
@@ -706,7 +831,7 @@ impl ArmDebugSequence for Kinetis {
     fn debug_device_unlock(
         &self,
         iface: &mut dyn ArmDebugInterface,
-        _default_ap: &FullyQualifiedApAddress,
+        default_ap: &FullyQualifiedApAddress,
         permissions: &crate::Permissions,
     ) -> Result<(), ArmError> {
         let mdm_ap = &MDM_AP;
@@ -719,19 +844,49 @@ impl ArmDebugSequence for Kinetis {
             );
         }
 
-        // Stabilize system before checking security — on blank flash chips in a
-        // WDOG reset loop, this holds the core so is_secured() gets reliable reads.
-        mdm_halt(iface)?;
-
-        if !is_secured(iface)? {
-            tracing::info!("Kinetis device is unsecured");
-
-            if let Err(e) = self.enter_debug_halt(iface, _default_ap) {
-                tracing::warn!("Kinetis: first debug halt attempt failed ({e}), retrying mdm_halt");
-                mdm_halt(iface)?;
-                self.enter_debug_halt(iface, _default_ap)?;
+        // Look before touching anything. A plain attach to a running, unsecured
+        // chip must not reset it (that destroys the RAM state a user came to read)
+        // and must not leave it halted.
+        let (state, held_secured) = sample_system_state(iface)?;
+        let secured = match state {
+            SystemState::Running => is_secured(iface)?,
+            SystemState::HeldInReset => {
+                // nRST is asserted (connect under reset). SYSSEC is valid on the
+                // MDM-AP in this state; the AHB-AP is not reachable, so nothing
+                // else can be done until `reset_hardware_deassert`.
+                tracing::debug!("Kinetis: system held in reset, SYSSEC={held_secured}");
+                held_secured
             }
+            SystemState::Unstable => {
+                // The system goes in and out of reset by itself. Hold it so the
+                // security check gets stable reads. This is the one attach path
+                // that resets the target, and it says so.
+                tracing::warn!(
+                    "Kinetis: system state unstable before attach (reset-looping firmware? \
+                     check RCM_SRS0); resetting and holding it to read the security state"
+                );
+                mdm_halt(iface)?;
+                is_secured(iface)?
+            }
+        };
 
+        if !secured {
+            tracing::info!("Kinetis device is unsecured");
+            match state {
+                SystemState::Running | SystemState::HeldInReset => {}
+                SystemState::Unstable => {
+                    // Still under CORE_HOLD_RES from mdm_halt. Halt properly,
+                    // disable the WDOG the reset re-armed, then let it run.
+                    if let Err(e) = self.enter_debug_halt(iface, default_ap) {
+                        tracing::warn!(
+                            "Kinetis: first debug halt attempt failed ({e}), retrying mdm_halt"
+                        );
+                        mdm_halt(iface)?;
+                        self.enter_debug_halt(iface, default_ap)?;
+                    }
+                    self.release_and_run(iface, default_ap)?;
+                }
+            }
             return Ok(());
         }
 
@@ -755,6 +910,22 @@ impl ArmDebugSequence for Kinetis {
         _debug_base: Option<u64>,
     ) -> Result<(), ArmError> {
         use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
+
+        // While nRST is held (connect under reset) the AHB-AP is unreachable, so
+        // DEMCR cannot be written. Arm MDM-AP CORE_HOLD_RES instead: the core then
+        // stays parked when the system leaves reset, and `reset_hardware_deassert`
+        // converts that into a proper VC_CORERESET halt.
+        {
+            let iface = core.get_arm_debug_interface().map_err(ArmError::from)?;
+            let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
+            if (status & MDM_STAT_SYSRES) == 0 {
+                tracing::debug!(
+                    "Kinetis: system in reset (status {status:#010x}), arming CORE_HOLD_RES as reset catch"
+                );
+                iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, MDM_CTRL_CORE_HOLD_RES)?;
+                return Ok(());
+            }
+        }
 
         // Use VC_CORERESET (not MDM CORE_HOLD_RES) — gives proper S_HALT=1.
         let mut demcr = Demcr(core.read_word_32(Demcr::get_mmio_address())?);
@@ -786,35 +957,20 @@ impl ArmDebugSequence for Kinetis {
         Ok(())
     }
 
-    fn reset_system(
+    fn reset_hardware_deassert(
         &self,
-        interface: &mut dyn ArmMemoryInterface,
-        core_type: crate::CoreType,
-        debug_base: Option<u64>,
+        iface: &mut dyn ArmDebugInterface,
+        default_ap: &FullyQualifiedApAddress,
     ) -> Result<(), ArmError> {
-        let core_ap = interface.fully_qualified_address();
+        DefaultArmSequence(()).reset_hardware_deassert(iface, default_ap)?;
 
-        let iface = interface
-            .get_arm_debug_interface()
-            .map_err(ArmError::from)?;
-
-        tracing::debug!("Kinetis: asserting system reset via MDM-AP");
-        iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ)?;
-
-        let start = Instant::now();
-        loop {
-            let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
-            if (status & MDM_STAT_SYSRES) == 0 {
-                break;
-            }
-            if start.elapsed() >= Duration::from_millis(500) {
-                tracing::warn!("Timeout waiting for SYSRES, continuing anyway");
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
+        // If `reset_catch_set` armed CORE_HOLD_RES, the core is now parked at
+        // reset exit with the AHB-AP alive. Turn that into a real debug halt so
+        // the session's `wait_for_core_halted` and `reset_catch_clear` work.
+        let control = iface.read_raw_ap_register(&MDM_AP, MDM_CONTROL)?;
+        if (control & MDM_CTRL_CORE_HOLD_RES) == 0 {
+            return Ok(());
         }
-
-        iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, 0)?;
 
         let start = Instant::now();
         loop {
@@ -822,14 +978,107 @@ impl ArmDebugSequence for Kinetis {
             if (status & MDM_STAT_SYSRES) != 0 {
                 break;
             }
-            if start.elapsed() >= Duration::from_millis(500) {
-                tracing::warn!("Timeout waiting for system to exit reset");
+            if start.elapsed() > Duration::from_millis(500) {
+                tracing::warn!(
+                    "Kinetis: system still in reset after nRST release (status {status:#010x})"
+                );
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
 
-        self.debug_core_start(iface, &core_ap, core_type, debug_base, None)?;
+        self.enter_debug_halt(iface, default_ap)
+    }
+
+    fn reset_system(
+        &self,
+        interface: &mut dyn ArmMemoryInterface,
+        core_type: crate::CoreType,
+        debug_base: Option<u64>,
+    ) -> Result<(), ArmError> {
+        use crate::architecture::arm::core::armv7m::{Demcr, Dhcsr};
+
+        let core_ap = interface.fully_qualified_address();
+
+        // Every probe-initiated reset re-arms the WDOG (see module docs). To
+        // disable it the core has to be halted at the reset vector, so a reset
+        // that was not asked to halt is halted briefly and resumed afterwards.
+        let demcr = Demcr(interface.read_word_32(Demcr::get_mmio_address())?);
+        let caller_wants_halt = demcr.vc_corereset();
+        if !caller_wants_halt {
+            let mut dhcsr = Dhcsr(0);
+            dhcsr.set_c_debugen(true);
+            dhcsr.enable_write();
+            interface.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+            let mut demcr = demcr;
+            demcr.set_vc_corereset(true);
+            interface.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
+        }
+
+        {
+            let iface = interface
+                .get_arm_debug_interface()
+                .map_err(ArmError::from)?;
+
+            tracing::debug!("Kinetis: asserting system reset via MDM-AP");
+            iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, MDM_CTRL_SYS_RES_REQ)?;
+
+            let start = Instant::now();
+            loop {
+                let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
+                if (status & MDM_STAT_SYSRES) == 0 {
+                    break;
+                }
+                if start.elapsed() >= Duration::from_millis(500) {
+                    tracing::warn!("Timeout waiting for SYSRES, continuing anyway");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            iface.write_raw_ap_register(&MDM_AP, MDM_CONTROL, 0)?;
+
+            let start = Instant::now();
+            loop {
+                let status = iface.read_raw_ap_register(&MDM_AP, MDM_STATUS)?;
+                if (status & MDM_STAT_SYSRES) != 0 {
+                    break;
+                }
+                if start.elapsed() >= Duration::from_millis(500) {
+                    tracing::warn!("Timeout waiting for system to exit reset");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            self.debug_core_start(iface, &core_ap, core_type, debug_base, None)?;
+        }
+
+        if !caller_wants_halt {
+            // Wait for the vector catch, disable the WDOG, disarm, resume.
+            let start = Instant::now();
+            loop {
+                let dhcsr = interface.read_word_32(Dhcsr::get_mmio_address())?;
+                if (dhcsr & (1 << 17)) != 0 {
+                    break;
+                }
+                if start.elapsed() >= Duration::from_millis(500) {
+                    tracing::warn!("Kinetis: core did not halt at reset vector; WDOG left as is");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            if let Err(e) = disable_wdog(interface) {
+                tracing::warn!("Kinetis: WDOG disable failed ({e}), firmware must handle WDOG");
+            }
+            let mut demcr = Demcr(interface.read_word_32(Demcr::get_mmio_address())?);
+            demcr.set_vc_corereset(false);
+            interface.write_word_32(Demcr::get_mmio_address(), demcr.into())?;
+            let mut dhcsr = Dhcsr(0);
+            dhcsr.set_c_debugen(true);
+            dhcsr.enable_write();
+            interface.write_word_32(Dhcsr::get_mmio_address(), dhcsr.into())?;
+        }
 
         Ok(())
     }
